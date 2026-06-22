@@ -3,6 +3,7 @@
 HiDream-O1-Image is a natively unified image generative foundation model built on a Pixel-level Unified Transformer (UiT) without external VAEs or disjoint text encoders, which natively encodes raw pixels, text, and task-specific conditions in a single shared token space — supporting text-to-image, image editing, and subject-driven personalization at up to 2,048 × 2,048.
 
 ## Project Updates
+- 💬 **June 22, 2026:** Join our Discord community for questions, support, and discussions. [![Discord](https://img.shields.io/badge/Discord-Join%20Community-5865F2?style=flat&logo=discord&logoColor=white)](https://discord.gg/7ZEnPxdTQ)
 - 🚀 **May 14, 2026:** We open-sourced [**HiDream-O1-Image-Dev-2604**](https://huggingface.co/HiDream-ai/HiDream-O1-Image-Dev-2604) with its [prompt refiner](https://huggingface.co/HiDream-ai/Prompt-Refine), tailored for text-to-image generation task.
 - 🛠️ **May 13, 2026:** Inference & pipeline updates — accelerated IP inference; the IP pipeline now supports **layout** and **skeleton** conditioning; updated the Dev editing scheduler. For editing tasks we recommend using the **full** model. PyTorch 2.9.x is not recommended due to the [issue](https://github.com/QwenLM/Qwen3-VL/issues/1811).
 - 🤗 **May 10, 2026:** Try **HiDream-O1-Image** online on Hugging Face Spaces — [🤗 HiDream-O1-Image](https://huggingface.co/spaces/HiDream-ai/HiDream-O1-Image) and [🤗 HiDream-O1-Image-Dev](https://huggingface.co/spaces/HiDream-ai/HiDream-O1-Image-Dev).
