@@ -1,0 +1,72 @@
+# Long run: full Distinctions-646, 20k optimizer steps, 1024x1024.
+#
+# Differs from d646_1024.yaml (the 32-sample overfit pilot) in three ways:
+#   overfit_samples 0  -- the whole 59,600-composite training split rather than
+#                         a fixed subset, so this measures generalisation and
+#                         not fit. Compositing is ~1.6s a sample and uncached
+#                         here by design: full training sees each composite once,
+#                         where a cache would only waste memory.
+#   save_every 1000    -- 20 checkpoints at ~254 MB rather than 80 at the pilot's
+#                         cadence, which would be 20 GB of adapters.
+#   val_every 500      -- the conditioning-gap check costs 24 forward passes.
+
+resolution: 1024
+overfit_samples: 0
+prompt: "Extract the foreground object and generate alpha matte"
+
+lora_rank: 32
+lora_alpha: 32
+gradient_checkpointing: true
+
+timestep_type: uniform
+shift: 3.0
+cfg_dropout: 0.1
+
+lr: 5.0e-5
+weight_decay: 0.01
+max_grad_norm: 1.0
+# Floor on sampled sigma. The loss divides by sigma, so its weight goes as
+# 1/sigma^2: at the old floor of 1e-3 a draw could carry a weight of 1e6.
+# Measured on the first run of this config: 28% of optimizer steps hit the
+# gradient clip, scaled down 27x on average, max |g| 333. Those updates are
+# noise, and the run plateaued at step ~200 and then drifted UP (+10.5% x0_mse
+# over the second half). 0.05 caps the weight at 400 and removes the tail.
+sigma_min: 0.05
+# Effective batch = batch_size x grad_accum = 16, matching Edit2Perceive's
+# matting run (`--batch_size 4` over 4 GPUs, output dir `bs16_...`).
+# Batching is exact, not an approximation: a batch-2 forward reproduces two
+# separate batch-1 forwards bit for bit, because the token layout depends only
+# on (prompt, resolution) and is shared across the batch. Measured per-sample
+# cost 1.44s at batch 1, 0.77s at batch 4; peak memory 24 GB of 150 GB.
+# All samples in a batch share one prompt, so CFG dropout is per batch.
+batch_size: 4
+grad_accum: 4          # effective batch 16; set 8 here for 32
+max_steps: 20000
+# Fixed for the whole run: controls data order, noise, sigma draws and CFG
+# dropout. Changing it on a resume starts a different statistical trajectory.
+seed: 42
+
+# Preview panel, the PixelDiT-style one: three columns, input RGB | generated
+# alpha | ground truth, sampled with the real 28-step trajectory.
+#
+# This is the ONLY thing here that actually generates. log_every is free,
+# val_every takes single forward passes at fixed sigma. Those measure denoising,
+# not generation, and the two disagreed badly in the sampler A/B: the arm with
+# the better validation gap (97% vs 71.6%) was the one producing flat mattes
+# (generated_mse 0.205 vs 0.005). Judge the run on preview/generated_mse.
+#
+# Costs num_examples x sampling_steps forwards, ~30s for 2 x 28, so keep it well
+# above val_every or it dominates the step time.
+preview_every: 50
+wandb_num_examples: 4
+# 2 was too few: one hard sample dominates the mean. The fixed pair happened to
+# include a 23%-soft-pixel subject and read as a failing model while the
+# rotating panel showed 5x better on the same weights.
+preview_fixed_samples: 4
+wandb_sampling_steps: 28    # 28 is the Dev checkpoint's own schedule
+wandb_guidance: 1.0
+
+log_every: 10
+val_every: 0
+val_samples: 4
+save_every: 500

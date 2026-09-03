@@ -338,7 +338,7 @@ def generate_image(
                 "vinputs": z_in,
                 "timestep": t_pixeldit.reshape(-1).to(device),
                 "token_types": sample['token_types'],
-                "use_flash_attn": True,
+                "use_flash_attn": False,
                 "precomputed_image_embeds": precomputed_image_embeds,
                 "precomputed_deepstack_image_embeds": precomputed_deepstack_image_embeds
             }

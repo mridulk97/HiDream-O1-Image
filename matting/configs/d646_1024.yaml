@@ -1,0 +1,44 @@
+# D-646 matting, 1024x1024, LoRA r16. Overfit pilot.
+#
+# 1024 rather than 2048 on purpose: the paper trains Stage II at 1024x1024 and
+# that is the stage which introduced editing and subject-driven conditioning,
+# so it is the resolution the conditioning pathway was actually trained at
+# (2605.11061 4.1). `find_closest_resolution` snaps 1024 -> 2048 on the
+# inference path, which is why probe_sampler.py patches it out.
+
+resolution: 1024
+overfit_samples: 32
+prompt: "Transform to matting map while maintaining original composition"
+
+lora_rank: 16
+lora_alpha: 16
+gradient_checkpointing: true
+
+# uniform, settled by A/B at matched step 2000 (see matting/README.md):
+#   generated_mse  uniform 0.00498  vs  sigmoid 0.20458  -- 41x, and sigmoid is
+#   worse than the constant-mean baseline of 0.193.
+# sigmoid (logit-normal, ai-toolkit's default) is excellent from sigma 0.95 down
+# and collapses above it -- 0.607 at sigma 0.999 against uniform's 0.022 -- and
+# sampling starts at 0.999. It also *degrades* there as it trains, from 0.22 at
+# step 250 to 0.43 at step 2000, forgetting a region it never practises.
+timestep_type: uniform
+shift: 3.0
+cfg_dropout: 0.1
+
+lr: 1.0e-4
+weight_decay: 0.01
+max_grad_norm: 1.0
+# Effective batch = batch_size x grad_accum = 16, matching Edit2Perceive's
+# matting run (`--batch_size 4` over 4 GPUs, output dir `bs16_...`).
+# Batching is exact here, not an approximation: a batch-2 forward reproduces two
+# separate batch-1 forwards bit for bit (max |delta| 0.000e+00), because the
+# token layout depends only on (prompt, resolution) and is shared across the
+# batch. Measured per-sample cost: 1.44 s at batch 1, 0.77 s at batch 4.
+# All samples in a batch share one prompt, so CFG dropout is decided per batch.
+batch_size: 4
+grad_accum: 4          # effective batch 16
+max_steps: 3000
+seed: 2025
+
+log_every: 10
+save_every: 250
