@@ -73,14 +73,25 @@ def build_matting_sample(
     model_config,
     device=None,
     dtype=torch.bfloat16,
+    layout_image=None,
+    layout_size=512,
 ):
-    """One image-conditioned training sample.
+    """One image-conditioned training sample, with an optional layout image.
 
     Args:
-        cond_image: the conditioning RGB, either a PIL image or a (C, H, W)
-            tensor in [-1, 1] already at `height` x `width`.
+        cond_image: the conditioning RGB, PIL or (C, H, W) tensor in [-1, 1],
+            already at `height` x `width`.
         prompt: instruction text. Pass " " for the unconditional branch.
-        height, width: target size, both multiples of `PATCH_SIZE`.
+        layout_image: optional PIL rendered by `matting.bbox.render_layout_image`
+            -- a black canvas with the box drawn on it. Appended as a *second
+            reference image*; HiDream has no other bbox mechanism.
+        layout_size: the layout image is a rectangle outline on black and
+            carries almost no information, so it is rendered smaller than the
+            photo. At 512 it costs 256 tokens against the photo's 1024. The
+            shipped heuristic (pipeline.py:199) would instead shrink *both*
+            references to 768 at K=2, which would cost the photo the fine
+            detail matting depends on. Each reference carries its own
+            `image_grid_thw`, so they need not match.
 
     Returns a dict carrying everything the model forward needs except `vinputs`
     (which the caller assembles as `cat([noisy_target, ref_patches])`, since the
@@ -107,36 +118,43 @@ def build_matting_sample(
             f"dataset where they can be verified"
         )
 
+    # (image, max_size) per reference, in sequence order. The photo keeps the
+    # full target resolution; anything after it is a visual prompt.
+    ref_specs = [(cond_pil, max(height, width))]
+    if layout_image is not None:
+        ref_specs.append((layout_image.convert("RGB"), layout_size))
+    num_refs = len(ref_specs)
+
     # Both streams derive from `resize_pilimage`'s output, because that is what
     # inference does (pipeline.py:216-224) and train/test preprocessing has to
-    # agree. For a square image already at `max_size` it is a verified no-op
-    # (the BICUBIC pass at utils.py:232 is exact at unchanged size), so this
-    # costs nothing today; it is here so that a non-square or non-1024 target
-    # stays aligned with inference instead of silently diverging.
-    max_size = max(height, width)  # K == 1
-    pil_r = resize_pilimage(cond_pil, max_size, PATCH_SIZE)
+    # agree. For a square image already at `max_size` it is a verified no-op.
+    ref_pils, ref_patch_list, ref_lens = [], [], []
+    for pil, max_size in ref_specs:
+        pil_r = resize_pilimage(pil, max_size, PATCH_SIZE)
+        ref_pils.append(pil_r)
+        patches = patchify(TENSOR_TRANSFORM(pil_r))
+        ref_patch_list.append(patches.unsqueeze(0))
+        ref_lens.append(patches.shape[0])
+    ref_patches = torch.cat(ref_patch_list, dim=1)
+    total_ref_len = sum(ref_lens)
 
-    # Reference patch stream: full-resolution RGB, patchified exactly as the
-    # noisy target is, and embedded by the same `x_embedder`.
-    ref_patches = patchify(TENSOR_TRANSFORM(pil_r)).unsqueeze(0)
-    total_ref_len = ref_patches.shape[1]
-
-    # VLM condition stream: the same image at 384px through Qwen3-VL's encoder.
-    cond_w, cond_h = calculate_dimensions(CONDITION_IMAGE_SIZE, pil_r.width / pil_r.height)
-    cond_pil_vlm = pil_r.resize((cond_w, cond_h), resample=Image.LANCZOS)
+    # VLM condition stream: every reference also goes through Qwen3-VL at 384px.
+    cond_pils_vlm = []
+    for pil_r in ref_pils:
+        cw, ch = calculate_dimensions(CONDITION_IMAGE_SIZE, pil_r.width / pil_r.height)
+        cond_pils_vlm.append(pil_r.resize((cw, ch), resample=Image.LANCZOS))
 
     boi_token = getattr(tokenizer, "boi_token", "<|boi_token|>")
     tms_token = getattr(tokenizer, "tms_token", "<|tms_token|>")
 
-    messages = [{"role": "user", "content": [
-        {"type": "image"},
-        {"type": "text", "text": prompt},
-    ]}]
+    content = [{"type": "image"} for _ in range(num_refs)]
+    content.append({"type": "text", "text": prompt})
+    messages = [{"role": "user", "content": content}]
     template_caption = processor.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
     )
     proc = processor(
-        text=[template_caption], images=[cond_pil_vlm],
+        text=[template_caption], images=cond_pils_vlm,
         padding="longest", return_tensors="pt",
     )
     input_ids_2 = tokenizer.encode(
@@ -150,29 +168,34 @@ def build_matting_sample(
         [1, height // PATCH_SIZE, width // PATCH_SIZE], dtype=torch.int64
     ).unsqueeze(0)
     image_grid_thw_ref = torch.tensor(
-        [1, pil_r.height // PATCH_SIZE, pil_r.width // PATCH_SIZE], dtype=torch.int64
-    ).unsqueeze(0)
+        [[1, p.height // PATCH_SIZE, p.width // PATCH_SIZE] for p in ref_pils],
+        dtype=torch.int64,
+    )
 
     igthw_cond = proc.image_grid_thw.clone()
-    igthw_cond[0, 1] //= spatial_merge_size
-    igthw_cond[0, 2] //= spatial_merge_size
+    igthw_cond[:, 1] //= spatial_merge_size
+    igthw_cond[:, 2] //= spatial_merge_size
     igthw_all = torch.cat([igthw_cond, image_grid_thw_tgt, image_grid_thw_ref], dim=0)
 
-    # Vision placeholder tokens, target block then reference block. Only the
-    # first position of each block carries `vision_start`; the rope helper is
-    # told to skip it for the streams that are already positioned.
+    # Vision placeholder tokens: target block, then one block per reference.
+    # Only the first position of each block carries `vision_start`; the rope
+    # helper is told to skip it for the streams that are already positioned.
     vt_tgt = torch.full((1, tgt_image_len), image_token_id, dtype=input_ids.dtype)
     vt_tgt[0, 0] = vision_start_token_id
-    vt_ref = torch.full((1, total_ref_len), image_token_id, dtype=input_ids.dtype)
-    vt_ref[0, 0] = vision_start_token_id
-    vision_tokens = torch.cat([vt_tgt, vt_ref], dim=1)
+    vision_blocks = [vt_tgt]
+    for rl in ref_lens:
+        vt_ref = torch.full((1, rl), image_token_id, dtype=input_ids.dtype)
+        vt_ref[0, 0] = vision_start_token_id
+        vision_blocks.append(vt_ref)
+    vision_tokens = torch.cat(vision_blocks, dim=1)
     input_ids_pad = torch.cat([input_ids, vision_tokens], dim=-1)
 
     position_ids, _ = get_rope_index_fix_point(
         1, image_token_id, video_token_id, vision_start_token_id,
         input_ids=input_ids_pad, image_grid_thw=igthw_all,
         video_grid_thw=None, attention_mask=None,
-        skip_vision_start_token=[0, 1, 1],  # [cond] + [target] + [ref]
+        # [VLM conds] + [target] + [reference patch streams]
+        skip_vision_start_token=[0] * num_refs + [1] + [1] * num_refs,
     )
 
     txt_seq_len = input_ids.shape[-1]
@@ -182,7 +205,7 @@ def build_matting_sample(
     bgn = txt_seq_len - TIMESTEP_TOKEN_NUM
     end = bgn + tgt_image_len + TIMESTEP_TOKEN_NUM
     token_types_raw[0, bgn:end] = 1                       # timestep + target
-    token_types_raw[0, end:end + total_ref_len] = 2       # reference
+    token_types_raw[0, end:end + total_ref_len] = 2       # every reference
     token_types_raw[0, txt_seq_len - TIMESTEP_TOKEN_NUM:txt_seq_len] = 3  # tms
 
     vinput_mask = torch.logical_or(token_types_raw == 1, token_types_raw == 2)
@@ -199,6 +222,7 @@ def build_matting_sample(
         "tgt_image_len": tgt_image_len,
         "total_ref_len": total_ref_len,
         "txt_seq_len": txt_seq_len,
+        "num_refs": num_refs,
     }
     if device is not None:
         sample = {
@@ -267,5 +291,6 @@ def collate_samples(samples):
         "tgt_image_len": ref["tgt_image_len"],
         "total_ref_len": ref["total_ref_len"],
         "txt_seq_len": ref["txt_seq_len"],
+        "num_refs": ref["num_refs"],
         "batch_size": batch,
     }

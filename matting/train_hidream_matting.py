@@ -47,7 +47,8 @@ from torch import nn
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(_HERE))
 
-from matting.data import DEFAULT_D646_ROOT, DEFAULT_PROMPT, D646MattingDataset  # noqa: E402
+from matting.data import (  # noqa: E402
+    DEFAULT_D646_ROOT, DEFAULT_PROMPT, build_dataset)
 from matting.sample_builder import (  # noqa: E402
     build_matting_sample, collate_samples, patchify)
 
@@ -178,6 +179,33 @@ def trainable_state_dict(model):
 
 
 # --------------------------------------------------------------------------- #
+# sample construction
+# --------------------------------------------------------------------------- #
+
+def make_sample(item, prompt, args, tokenizer, processor, model_config,
+                device, dtype, bbox=None):
+    """Item -> model sample, rendering the bbox layout image when enabled.
+
+    Used by training, validation and previews alike so all three build the
+    sequence identically -- a mismatch there is the kind of bug that shows up as
+    an unexplained metric rather than an error.
+
+    `bbox` overrides the item's own box; the box-gap probe passes a different
+    sample's box through here to test whether the model reads it at all.
+    """
+    layout = None
+    if args.use_bbox:
+        from matting.bbox import render_layout_image
+        box = item["bbox"] if bbox is None else bbox
+        layout = render_layout_image(box, args.bbox_resolution, args.bbox_resolution)
+    return build_matting_sample(
+        cond_image=item["condition"], prompt=prompt,
+        height=args.resolution, width=args.resolution, tokenizer=tokenizer,
+        processor=processor, model_config=model_config, device=device,
+        dtype=dtype, layout_image=layout, layout_size=args.bbox_resolution)
+
+
+# --------------------------------------------------------------------------- #
 # validation
 # --------------------------------------------------------------------------- #
 
@@ -222,11 +250,9 @@ def validate(model, dataset, indices, args, tokenizer, processor, model_config,
 
             for cond, is_correct in ((item["condition"], True),
                                      (other["condition"], False)):
-                sample = build_matting_sample(
-                    cond_image=cond, prompt=args.prompt,
-                    height=args.resolution, width=args.resolution,
-                    tokenizer=tokenizer, processor=processor,
-                    model_config=model_config, device=device, dtype=dtype)
+                sample = make_sample(
+                    {**item, "condition": cond}, args.prompt, args, tokenizer,
+                    processor, model_config, device, dtype)
                 vinputs = torch.cat([z.to(dtype), sample["ref_patches"]], dim=1)
                 with torch.autocast("cuda", dtype=dtype, cache_enabled=False):
                     out = model(
@@ -296,10 +322,16 @@ def log_preview(model, dataset, indices, args, tokenizer, processor,
     rows, mses, ids, blacks, means = [], [], [], [], []
     for i in indices:
         item = dataset[i]
+        layout = None
+        if args.use_bbox:
+            from matting.bbox import render_layout_image
+            layout = render_layout_image(item["bbox"], args.bbox_resolution,
+                                         args.bbox_resolution)
         alpha = sample_one(
             model, item["condition"], args.prompt, args.resolution, tokenizer,
             processor, model_config, device, dtype, args.wandb_sampling_steps,
-            args.wandb_guidance, args.shift, args.preview_seed + i)
+            args.wandb_guidance, args.shift, args.preview_seed + i,
+            layout_image=layout, layout_size=args.bbox_resolution)
         ids.append(item["sample_id"])
         gt = ((item["alpha_rgb"][0].float() + 1) / 2).clamp(0, 1).numpy()
         rgb = ((item["condition"].float() + 1) / 2).clamp(0, 1).numpy().transpose(1, 2, 0)
@@ -359,15 +391,19 @@ def train(args):
     torch.manual_seed(args.seed)
     random.seed(args.seed)
 
-    dataset = D646MattingDataset(
-        root=args.d646_root, resolution=args.resolution, split="train",
+    dataset = build_dataset(
+        names=args.datasets, resolution=args.resolution, split="train",
         overfit_samples=args.overfit_samples, prompt=args.prompt,
+        use_bbox=args.use_bbox, bbox_jitter=args.bbox_jitter,
+        weights=args.dataset_weights,
     )
-    print(f"[data] {len(dataset)} samples at {args.resolution}px | "
-          f"batch {args.batch_size} x accum {args.grad_accum} = effective "
-          f"{args.batch_size * args.grad_accum}")
+    print(f"[data] {'+'.join(args.datasets)}: {len(dataset)} samples at "
+          f"{args.resolution}px | batch {args.batch_size} x accum "
+          f"{args.grad_accum} = effective {args.batch_size * args.grad_accum}"
+          f"{' | bbox on, jitter ' + str(args.bbox_jitter) if args.use_bbox else ''}")
     with open(os.path.join(run_dir, "manifest.json"), "w") as fh:
-        json.dump({"sample_ids": dataset.sample_ids(),
+        ids = dataset.sample_ids() if hasattr(dataset, "sample_ids") else None
+        json.dump({"sample_ids": ids, "datasets": list(args.datasets),
                    "overfit_samples": args.overfit_samples}, fh, indent=2)
 
     model, processor, tokenizer, model_config = setup_model(
@@ -421,11 +457,19 @@ def train(args):
     # here instead.
     n_fixed = max(args.val_samples, args.preview_fixed_samples)
     stride = max(1, len(dataset) // max(1, n_fixed))
-    val_indices = [i * stride for i in range(min(n_fixed, len(dataset)))]
+    # `i * stride + i`, not `i * stride`. A mixture interleaves sources by
+    # index parity, so an even stride would land every validation sample on the
+    # same dataset -- with d646+am2k and stride 4, indices 0/4/8/12 are all
+    # d646 and AM-2k is never validated. The extra +i breaks that alignment
+    # while still spanning the dataset.
+    val_indices = [(i * stride + i) % len(dataset)
+                   for i in range(min(n_fixed, len(dataset)))]
     if len(dataset) > 1:
-        cats = {dataset.inner.dataset[i]["category"] for i in val_indices}
+        cats = {dataset[i]["category"] for i in val_indices}
+        srcs = {dataset[i].get("dataset", "?") for i in val_indices}
         print(f"[val] fixed subset: {len(val_indices)} samples spanning "
-              f"{len(cats)} distinct foregrounds (stride {stride})")
+              f"{len(cats)} distinct foregrounds from {sorted(srcs)} "
+              f"(stride {stride})")
 
     log_path = os.path.join(run_dir, "train_log.jsonl")
     gen = torch.Generator().manual_seed(args.seed + start_step)
@@ -451,11 +495,8 @@ def train(args):
         prompt = " " if random.random() < args.cfg_dropout else args.prompt
 
         samples = [
-            build_matting_sample(
-                cond_image=it["condition"], prompt=prompt,
-                height=args.resolution, width=args.resolution,
-                tokenizer=tokenizer, processor=processor,
-                model_config=model_config, device=device, dtype=dtype)
+            make_sample(it, prompt, args, tokenizer, processor, model_config,
+                        device, dtype)
             for it in items
         ]
         sample = collate_samples(samples) if len(samples) > 1 else samples[0]
@@ -610,6 +651,18 @@ def build_parser():
     p.add_argument("--config", default=None, help="YAML of any of the flags below")
     p.add_argument("--model_path", default=DEFAULT_MODEL)
     p.add_argument("--d646_root", default=DEFAULT_D646_ROOT)
+    p.add_argument("--datasets", nargs="+", default=["d646"],
+                   choices=["d646", "am2k"])
+    p.add_argument("--dataset_weights", nargs="+", type=float, default=None,
+                   help="mixture weights, e.g. 1 1 for 50/50; default equal")
+    p.add_argument("--use_bbox", action="store_true", default=False,
+                   help="append a rendered bbox layout image as a 2nd reference")
+    p.add_argument("--bbox_jitter", type=float, default=0.1,
+                   help="per-edge random expand/shrink; stops the model copying "
+                        "the box as a mask")
+    p.add_argument("--bbox_resolution", type=int, default=512,
+                   help="the layout image is a rectangle on black, so it needs "
+                        "far less resolution than the photo (256 vs 1024 tokens)")
     p.add_argument("--resolution", type=int, default=1024)
     p.add_argument("--prompt", default=DEFAULT_PROMPT)
     p.add_argument("--overfit_samples", type=int, default=32)

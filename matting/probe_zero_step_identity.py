@@ -26,7 +26,8 @@ import torch.nn.functional as F
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(_HERE))
 
-from matting.data import DEFAULT_D646_ROOT, DEFAULT_PROMPT, D646MattingDataset  # noqa: E402
+from matting.data import (  # noqa: E402
+    DEFAULT_D646_ROOT, DEFAULT_PROMPT, build_dataset)
 from matting.sample_builder import build_matting_sample, patchify  # noqa: E402
 from matting.train_hidream_matting import (  # noqa: E402
     DEFAULT_MODEL, FULL_TRAIN_MODULES, NOISE_SCALE, T_EPS, lora_target_modules,
@@ -41,6 +42,8 @@ def main():
     ap.add_argument("--sigma", type=float, default=0.5)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--tol", type=float, default=1e-5)
+    ap.add_argument("--use_bbox", action="store_true", default=False)
+    ap.add_argument("--bbox_resolution", type=int, default=512)
     args = ap.parse_args()
 
     from peft import LoraConfig, get_peft_model
@@ -50,9 +53,14 @@ def main():
 
     device, dtype = torch.device("cuda"), torch.bfloat16
 
-    ds = D646MattingDataset(root=args.d646_root, resolution=args.size,
-                            overfit_samples=1)
+    ds = build_dataset(names=["d646"], resolution=args.size, overfit_samples=1,
+                       use_bbox=args.use_bbox, bbox_jitter=0.0)
     item = ds[0]
+    layout = None
+    if args.use_bbox:
+        from matting.bbox import render_layout_image
+        layout = render_layout_image(item["bbox"], args.bbox_resolution,
+                                     args.bbox_resolution)
 
     processor = AutoProcessor.from_pretrained(args.model_path)
     tokenizer = getattr(processor, "tokenizer", processor)
@@ -64,7 +72,10 @@ def main():
     sample = build_matting_sample(
         cond_image=item["condition"], prompt=DEFAULT_PROMPT,
         height=args.size, width=args.size, tokenizer=tokenizer,
-        processor=processor, model_config=model_config, device=device, dtype=dtype)
+        processor=processor, model_config=model_config, device=device,
+        dtype=dtype, layout_image=layout, layout_size=args.bbox_resolution)
+    print(f"[identity] num_refs={sample['num_refs']} "
+          f"total_ref_len={sample['total_ref_len']}")
 
     x0 = patchify(item["alpha_rgb"]).unsqueeze(0).to(device).float()
     g = torch.Generator().manual_seed(args.seed)

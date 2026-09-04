@@ -1,0 +1,55 @@
+# D-646 + AM-2k 50/50, 1024x1024, with bounding-box conditioning.
+#
+# The box is rendered as a layout image and appended as a SECOND reference
+# image; HiDream has no other bbox mechanism (models/utils.py:161). RoPE places
+# it in the next offset block on its own -- nothing to configure.
+#
+# Both datasets have one foreground per image, so the box localizes rather than
+# selects, and is redundant on every training sample. That makes
+# matting/probe_box_wiring.py the number to watch: if the box gap is under 10%
+# the model is ignoring the box and this config is doing nothing.
+
+resolution: 1024
+overfit_samples: 0
+prompt: "Transform to matting map while maintaining original composition"
+
+datasets: [d646, am2k]
+dataset_weights: [1, 1]
+
+use_bbox: true
+# Per-edge random expand/shrink. Not cosmetic: a pixel-exact box invites the
+# degenerate solution `alpha = box interior`, which scores well on single-object
+# data and is useless on anything real.
+bbox_jitter: 0.1
+# The layout image is a rectangle outline on black, so it needs far less
+# resolution than the photo: 256 tokens against the photo's 1024. The target and
+# the photo both stay at 1024.
+bbox_resolution: 512
+
+lora_rank: 16
+lora_alpha: 16
+gradient_checkpointing: true
+
+timestep_type: uniform
+shift: 3.0
+sigma_min: 0.05
+cfg_dropout: 0.1
+
+lr: 5.0e-5
+weight_decay: 0.01
+max_grad_norm: 1.0
+batch_size: 4
+grad_accum: 4          # effective batch 16
+max_steps: 20000
+seed: 42
+
+preview_every: 500
+wandb_num_examples: 4
+preview_fixed_samples: 4
+wandb_sampling_steps: 28
+wandb_guidance: 1.0
+
+log_every: 10
+val_every: 200
+val_samples: 4
+save_every: 500

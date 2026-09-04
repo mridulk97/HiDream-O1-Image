@@ -31,7 +31,8 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(_HERE))
 
 from models.pipeline import DEFAULT_TIMESTEPS, build_scheduler  # noqa: E402
-from matting.data import DEFAULT_D646_ROOT, DEFAULT_PROMPT, D646MattingDataset  # noqa: E402
+from matting.data import (  # noqa: E402
+    DEFAULT_D646_ROOT, DEFAULT_PROMPT, build_dataset)
 from matting.sample_builder import build_matting_sample, unpatchify  # noqa: E402
 from matting.train_hidream_matting import (  # noqa: E402
     DEFAULT_MODEL, FULL_TRAIN_MODULES, NOISE_SCALE, T_EPS, lora_target_modules,
@@ -67,19 +68,25 @@ def load_adapter(model, adapter_path):
 
 @torch.no_grad()
 def sample_one(model, cond_image, prompt, size, tokenizer, processor,
-               model_config, device, dtype, steps, guidance_scale, shift, seed):
-    """One conditioned sampling trajectory. Returns alpha in [0, 1], (H, W)."""
+               model_config, device, dtype, steps, guidance_scale, shift, seed,
+               layout_image=None, layout_size=512):
+    """One conditioned sampling trajectory. Returns alpha in [0, 1], (H, W).
+
+    `layout_image` is the rendered bbox (see `matting.bbox`), appended as a
+    second reference. Pass None to sample without a box.
+    """
     h_patches = w_patches = size // PATCH_SIZE
 
-    samples = [build_matting_sample(
-        cond_image=cond_image, prompt=prompt, height=size, width=size,
-        tokenizer=tokenizer, processor=processor, model_config=model_config,
-        device=device, dtype=dtype)]
-    if guidance_scale > 1.0:
-        samples.append(build_matting_sample(
-            cond_image=cond_image, prompt=" ", height=size, width=size,
+    def _build(p):
+        return build_matting_sample(
+            cond_image=cond_image, prompt=p, height=size, width=size,
             tokenizer=tokenizer, processor=processor, model_config=model_config,
-            device=device, dtype=dtype))
+            device=device, dtype=dtype, layout_image=layout_image,
+            layout_size=layout_size)
+
+    samples = [_build(prompt)]
+    if guidance_scale > 1.0:
+        samples.append(_build(" "))
 
     timesteps = DEFAULT_TIMESTEPS if steps == len(DEFAULT_TIMESTEPS) else None
     sched = build_scheduler(steps, timesteps, shift, device, "default")
@@ -137,6 +144,17 @@ def main():
     ap.add_argument("--shift", type=float, default=3.0)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--shuffle_conditions", action="store_true")
+    ap.add_argument("--datasets", nargs="+", default=["d646"],
+                    choices=["d646", "am2k"])
+    ap.add_argument("--use_bbox", action="store_true", default=False)
+    ap.add_argument("--bbox_jitter", type=float, default=0.0,
+                    help="0 at eval: the box should be the honest one unless "
+                         "the point is to test robustness to a sloppy box")
+    ap.add_argument("--bbox_resolution", type=int, default=512)
+    ap.add_argument("--box_from", default="gt", choices=["gt", "shuffled", "none"],
+                    help="gt = this sample's box; shuffled = a different "
+                         "sample's, which is the test for whether the model "
+                         "reads the box at all; none = no box")
     ap.add_argument("--save_npy", action="store_true")
     args = ap.parse_args()
 
@@ -147,10 +165,11 @@ def main():
     device, dtype = torch.device("cuda"), torch.bfloat16
     os.makedirs(args.output_dir, exist_ok=True)
 
-    ds = D646MattingDataset(root=args.d646_root, resolution=args.size,
-                            overfit_samples=args.overfit_samples,
-                            prompt=args.prompt)
+    ds = build_dataset(names=args.datasets, resolution=args.size,
+                       overfit_samples=args.overfit_samples, prompt=args.prompt,
+                       use_bbox=args.use_bbox, bbox_jitter=args.bbox_jitter)
     n = min(args.num_samples, len(ds))
+    boxes = [ds[i].get("bbox") for i in range(n)] if args.use_bbox else [None] * n
 
     processor = AutoProcessor.from_pretrained(args.model_path)
     tokenizer = getattr(processor, "tokenizer", processor)
@@ -165,10 +184,19 @@ def main():
         item = ds[i]
         # Deterministic derangement, same rule the in-training check uses.
         cond_item = ds[(i + 1) % n] if args.shuffle_conditions else item
+        layout = None
+        if args.use_bbox and args.box_from != "none":
+            from matting.bbox import render_layout_image
+            # "shuffled" is a deterministic derangement: sample i takes sample
+            # i+1's box, so nothing is ever paired with its own.
+            box = boxes[i] if args.box_from == "gt" else boxes[(i + 1) % n]
+            layout = render_layout_image(box, args.bbox_resolution,
+                                         args.bbox_resolution)
         alpha = sample_one(
             model, cond_item["condition"], args.prompt, args.size, tokenizer,
             processor, model_config, device, dtype, args.steps,
-            args.guidance_scale, args.shift, args.seed + i)
+            args.guidance_scale, args.shift, args.seed + i,
+            layout_image=layout, layout_size=args.bbox_resolution)
 
         gt = ((item["alpha_rgb"][0].float() + 1) / 2).clamp(0, 1).numpy()
         mse = float(np.mean((alpha - gt) ** 2))
@@ -181,7 +209,9 @@ def main():
             np.save(os.path.join(args.output_dir, f"{sid}.npy"),
                     alpha.astype(np.float32))
         records.append({"sample_id": sid, "mse": mse,
-                        "condition_from": cond_item["sample_id"]})
+                        "dataset": item.get("dataset", "?"),
+                        "condition_from": cond_item["sample_id"],
+                        "box_from": args.box_from if args.use_bbox else None})
         print(f"  {sid:>16}  mse {mse:.5f}"
               f"{'  (shuffled cond)' if args.shuffle_conditions else ''}",
               flush=True)

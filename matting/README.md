@@ -146,6 +146,93 @@ caps the weight at 400 and removes the tail, at the cost of never training the
 last sliver of the schedule; the default stays at 1e-3 because that is what the
 validated run used. Worth an A/B over a long run, not a silent default change.
 
+## Bounding-box conditioning
+
+HiDream's bbox support is not a coordinate embedding — **it is another reference
+image**. `create_layout_reference_images` (`models/utils.py:161`) renders the
+boxes onto a black canvas via `draw_bbox_layout` and appends that picture to the
+reference list, where it takes the same 384px VLM encoding and the same 32×32
+patch stream as any reference. There is no bbox token type and no bbox module.
+
+RoPE places it automatically. Verified with `get_rope_index_fix_point`:
+
+```
+                              t              h              w
+text prefix              0..164         0..164         0..164
+target 1024px              4096     4096..4127     4096..4127
+ref RGB 1024px             4128     4128..4159     4128..4159
+layout 512px               4160     4160..4175     4160..4175
+```
+
+The target is pinned at absolute 4096 by `fix_point`, so text length never
+shifts it, and each later raw-patch stream starts at `previous_max + 1`.
+
+**This is not the Kontext/FLUX.2 scheme.** Those shift only the temporal channel
+(`t += 10`) and leave h/w *aligned*, so image 2's pixel (5,5) shares h/w with
+image 1's. HiDream adds the offset to **all three** mRoPE channels, so
+corresponding pixels sit a constant 32 apart in h and w. RoPE encodes relative
+position, so that displacement is learnable — it just is not handed over for
+free.
+
+Three things this implementation does deliberately:
+
+**Only the layout image is small.** The target and the photo stay at 1024; the
+layout renders at 512. The shipped heuristic (`pipeline.py:199`) would shrink
+*both* references to 768 at K=2, costing the photo the fine detail matting needs.
+Each reference carries its own `image_grid_thw`, so they need not match. Cost:
+1024 + 1024 + 256 + ~300 ≈ 2.6k tokens against 2.4k at K=1.
+
+**`create_layout_reference_images` is not used.** It renders the layout image
+(wanted) *and* stamps a coloured border inside each photo
+(`add_outer_border_keep_size`) at ≈41px on a 1024 image (not wanted). That
+border binds subject↔box when there are several of each; with one object it is
+redundant, and it paints over the frame edge — exactly where a subject touching
+the border needs its matte. `matting/bbox.py` calls `draw_bbox_layout` directly.
+
+**The box is jittered.** Both datasets have one foreground per image, so the box
+is *redundant on every training sample* — the model can solve the task ignoring
+it — and a pixel-exact box invites `alpha ≈ box interior`, which scores well here
+and is useless anywhere else. `bbox_from_alpha` follows E2P's `gen_bbox`: largest
+connected component, then each edge moved in or out independently by up to
+`bbox_jitter` (0.1).
+
+Watch out for one convention: **HiDream's layout input is `xxyy`** —
+`[x1, x2, y1, y2]`, not `[x1, y1, x2, y2]` (`models/utils.py:62`). This codebase
+uses conventional xyxy everywhere and converts only inside
+`render_layout_image`.
+
+### The number that decides whether it works
+
+`probe_box_wiring.py` samples each image three ways — its own box, a *different*
+sample's box, and no box — on the same weights:
+
+```
+box gap = (shuffled_mse - correct_mse) / shuffled_mse
+```
+
+Under 10% means the model is ignoring the box and the change is doing nothing,
+whatever `generated_mse` says. Baseline on the pretrained checkpoint is **−0.9%**
+(measured), so any gap after training is attributable to training rather than to
+HiDream's pretrained layout ability. The probe also reports IoU between the
+prediction and the box interior: near 1.0 with rectangular output means the
+degenerate solution, and `bbox_jitter` needs raising.
+
+### Dataset mixture
+
+`build_dataset(names=["d646", "am2k"], weights=[1, 1])` interleaves by index
+parity, so a 50/50 mixture is 50/50 at *every prefix*, not merely in expectation
+over an epoch — concatenate-and-shuffle would let the ratio drift inside any
+window, which matters because the two differ sharply in difficulty. AM-2k is 1800
+real animal photographs with near-binary mattes (0.7–3.9% soft pixels); D-646 is
+composited and is where transparency lives (median 6.9%). **Report
+`generated_mse` per dataset**, or AM-2k's easier mattes will mask D-646
+regressions.
+
+One subtlety that bit us: validation indices are `i * stride + i`, not
+`i * stride`. With a two-source interleave and an even stride, every validation
+sample lands on the same dataset — with `d646+am2k` and stride 4, indices
+0/4/8/12 are all D-646 and AM-2k is never validated.
+
 ## Four ways the metrics lied
 
 Every one of these was a real measurement pointing at a wrong conclusion. They
