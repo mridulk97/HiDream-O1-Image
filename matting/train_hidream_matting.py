@@ -286,6 +286,29 @@ def validate(model, dataset, indices, args, tokenizer, processor, model_config,
 # preview
 # --------------------------------------------------------------------------- #
 
+def _overlay_box(rgb, bbox, color=(1.0, 0.0, 0.0), width=6):
+    """Outline the box on an RGB float array, in DEFAULT_COLORS[0] red.
+
+    Same colour the layout image is rendered in, so the panel's box and the
+    one the model was given read as the same object.
+    """
+    import numpy as np
+    out = rgb.copy()
+    h, w = out.shape[:2]
+    x1, y1, x2, y2 = bbox
+    x1, x2 = int(x1 * w), int(x2 * w)
+    y1, y2 = int(y1 * h), int(y2 * h)
+    c = np.asarray(color, dtype=out.dtype)
+    for t in range(width):
+        for a, b in ((y1 + t, None), (y2 - t, None)):
+            if 0 <= a < h:
+                out[a, max(0, x1):min(w, x2)] = c
+        for a, b in ((x1 + t, None), (x2 - t, None)):
+            if 0 <= a < w:
+                out[max(0, y1):min(h, y2), a] = c
+    return out
+
+
 @torch.no_grad()
 def log_preview(model, dataset, indices, args, tokenizer, processor,
                 model_config, device, dtype, run, step, tag="fixed"):
@@ -335,6 +358,13 @@ def log_preview(model, dataset, indices, args, tokenizer, processor,
         ids.append(item["sample_id"])
         gt = ((item["alpha_rgb"][0].float() + 1) / 2).clamp(0, 1).numpy()
         rgb = ((item["condition"].float() + 1) / 2).clamp(0, 1).numpy().transpose(1, 2, 0)
+        if args.use_bbox:
+            # Draw the box on a *copy* for display only -- the conditioning
+            # image the model saw is untouched. Without this the panel gives no
+            # way to tell a sensible box from a broken one, which matters here
+            # because the box is redundant on this data and a silently wrong
+            # box would look exactly like a model that ignores it.
+            rgb = _overlay_box(rgb, item["bbox"])
         mses.append(float(np.mean((alpha - gt) ** 2)))
         # Baselines are per-sample, not constants. all-black scores mean(gt**2),
         # which is just foreground coverage: it ranges from 0.07 on a small
@@ -355,7 +385,8 @@ def log_preview(model, dataset, indices, args, tokenizer, processor,
     # Fraction of the all-black baseline for THESE samples. Below 1.0 beats a
     # blank prediction; this is comparable across panels, the raw mse is not.
     rel = mean_mse / max(black, 1e-9)
-    caption = (f"step {step} | RGB | generated | GT | {tag} | mse {mean_mse:.5f} "
+    cols = "RGB+box | generated | GT" if args.use_bbox else "RGB | generated | GT"
+    caption = (f"step {step} | {cols} | {tag} | mse {mean_mse:.5f} "
                f"({rel:.0%} of all-black {black:.3f}, const-mean {cmean:.3f}) | "
                + ", ".join(ids))
     if run is not None:
