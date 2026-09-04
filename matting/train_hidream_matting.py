@@ -432,12 +432,12 @@ def train(args):
         names=args.datasets, resolution=args.resolution, split="train",
         overfit_samples=args.overfit_samples, prompt=args.prompt,
         use_bbox=args.use_bbox, bbox_jitter=args.bbox_jitter,
-        weights=args.dataset_weights,
+        bbox_jitter_prob=args.bbox_jitter_prob, weights=args.dataset_weights,
     )
     print(f"[data] {'+'.join(args.datasets)}: {len(dataset)} samples at "
           f"{args.resolution}px | batch {args.batch_size} x accum "
           f"{args.grad_accum} = effective {args.batch_size * args.grad_accum}"
-          f"{' | bbox on, jitter ' + str(args.bbox_jitter) if args.use_bbox else ''}")
+          f"{' | bbox on, jitter ' + str(args.bbox_jitter) + ' on ' + str(int(args.bbox_jitter_prob*100)) + '%' if args.use_bbox else ''}")
     with open(os.path.join(run_dir, "manifest.json"), "w") as fh:
         ids = dataset.sample_ids() if hasattr(dataset, "sample_ids") else None
         json.dump({"sample_ids": ids, "datasets": list(args.datasets),
@@ -700,9 +700,11 @@ def build_parser():
                    help="mixture weights, e.g. 1 1 for 50/50; default equal")
     p.add_argument("--use_bbox", action="store_true", default=False,
                    help="append a rendered bbox layout image as a 2nd reference")
-    p.add_argument("--bbox_jitter", type=float, default=0.1,
-                   help="per-edge random expand/shrink; stops the model copying "
-                        "the box as a mask")
+    p.add_argument("--bbox_jitter", type=float, default=0.05,
+                   help="max outward expansion per edge; stops the model "
+                        "copying the box as a mask")
+    p.add_argument("--bbox_jitter_prob", type=float, default=0.2,
+                   help="fraction of samples that get jittered at all")
     p.add_argument("--bbox_resolution", type=int, default=512,
                    help="the layout image is a rectangle on black, so it needs "
                         "far less resolution than the photo (256 vs 1024 tokens)")

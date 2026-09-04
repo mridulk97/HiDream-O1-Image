@@ -83,6 +83,27 @@ reference image is the *only* signal — and that is where the conditioning gap 
 smallest (2% on the pretrained model). The hard part of this task is generating
 a matte from the reference at high noise, not denoising one at low noise.
 
+## What deviates from ostris, and why
+
+Worth being explicit, because these are the places this trainer does not match
+the reference implementation:
+
+| | ostris | here | why |
+| --- | --- | --- | --- |
+| gradient clipping | `max_grad_norm` 1.0 | 1.0 | same; not a deviation |
+| σ floor | none — `T_EPS` 1e-3 only guards the *divisor* | **`sigma_min` 0.05 on the sampled σ** | see below |
+| timestep sampling | `sigmoid` (logit-normal) default | **uniform** | won the A/B 41x, below |
+| LoRA scope | every Linear in the model (374) | 252 decoder projections; pixel layers trained in full | see the LoRA section |
+
+The σ floor is the one worth understanding. Ostris's `T_EPS` is a `clamp_min` at
+the point of dividing, so a drawn σ of 0.0004 still yields a loss weight of 10⁶.
+They never hit that because their default sampler almost never visits σ < 0.01.
+The blowup only appears when ostris's velocity loss (which divides by σ) is
+combined with the paper's uniform SFT sampling (§4.2) — two recommendations from
+different sources that neither source runs together. Measured here: 28% of
+optimizer steps clipped, max |g| 333, one step at 2554. With `sigma_min` 0.05 the
+weight caps at 400 and clipping falls to 4%.
+
 ## Settled: uniform beats logit-normal by 41x end to end
 
 A/B at matched step 2000, 32-sample overfit subset, 8 sampled mattes each:
@@ -189,12 +210,25 @@ border binds subject↔box when there are several of each; with one object it is
 redundant, and it paints over the frame edge — exactly where a subject touching
 the border needs its matte. `matting/bbox.py` calls `draw_bbox_layout` directly.
 
-**The box is jittered.** Both datasets have one foreground per image, so the box
-is *redundant on every training sample* — the model can solve the task ignoring
-it — and a pixel-exact box invites `alpha ≈ box interior`, which scores well here
-and is useless anywhere else. `bbox_from_alpha` follows E2P's `gen_bbox`: largest
-connected component, then each edge moved in or out independently by up to
-`bbox_jitter` (0.1).
+**The box always contains the subject, and is jittered outward only.** Two
+heuristics from E2P's `gen_bbox` were tried and dropped, because their
+motivation does not carry over:
+
+* *Largest connected component.* E2P's box selects one object among several.
+  Ours localizes, and the ground truth is every foreground pixel, so dropping
+  the smaller components contradicts the target — a photo of two cows got a box
+  round one and a matte of both. Measured over 40 D-646 samples it put up to
+  **19.9%** of the alpha mass outside the box.
+* *Symmetric jitter.* Perturbing each edge in *or* out means the box sometimes
+  excludes part of the subject, which is an incoherent localization claim. It
+  was the larger effect: up to **23.7%** outside.
+
+`bbox_from_alpha` is therefore the simple thing — the extent of every pixel
+above threshold, as a half-open box — with jitter that only expands, applied to
+`bbox_jitter_prob` (0.2) of samples at up to `bbox_jitter` (0.05). Measured
+after the change: **0.0000%** of alpha mass outside the box across 80 samples,
+every jittered draw still enclosing the subject, 289 distinct boxes in 300 draws
+so it still cannot be memorised as a mask.
 
 Watch out for one convention: **HiDream's layout input is `xxyy`** —
 `[x1, x2, y1, y2]`, not `[x1, y1, x2, y2]` (`models/utils.py:62`). This codebase
@@ -216,6 +250,11 @@ whatever `generated_mse` says. Baseline on the pretrained checkpoint is **−0.9
 HiDream's pretrained layout ability. The probe also reports IoU between the
 prediction and the box interior: near 1.0 with rectangular output means the
 degenerate solution, and `bbox_jitter` needs raising.
+
+**No bbox run has produced a usable answer yet.** The one bbox run so far started
+before the `bbox_from_alpha` rewrite, so it trained on boxes that excluded up to
+a quarter of their own subject. Any claim about whether the model reads the box
+needs a fresh run on the corrected boxes plus this probe.
 
 ### Dataset mixture
 

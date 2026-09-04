@@ -20,7 +20,12 @@ use_bbox: true
 # Per-edge random expand/shrink. Not cosmetic: a pixel-exact box invites the
 # degenerate solution `alpha = box interior`, which scores well on single-object
 # data and is useless on anything real.
-bbox_jitter: 0.1
+bbox_jitter: 0.05
+# Only this fraction of samples get jittered; the rest see the exact box. The
+# jitter expands outward only, so a jittered box still contains the subject --
+# the point is that the model cannot assume the box is tight, not that the box
+# should ever be wrong.
+bbox_jitter_prob: 0.2
 # The layout image is a rectangle outline on black, so it needs far less
 # resolution than the photo: 256 tokens against the photo's 1024. The target and
 # the photo both stay at 1024.
@@ -50,6 +55,6 @@ wandb_sampling_steps: 28
 wandb_guidance: 1.0
 
 log_every: 10
-val_every: 200
+val_every: 0
 val_samples: 4
 save_every: 500

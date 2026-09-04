@@ -51,12 +51,14 @@ class _MattingAdapter(Dataset):
     channels back down.
     """
 
-    def __init__(self, inner, resolution, prompt, use_bbox, bbox_jitter, name):
+    def __init__(self, inner, resolution, prompt, use_bbox, bbox_jitter,
+                 bbox_jitter_prob, name):
         self.inner = inner
         self.resolution = resolution
         self.prompt = prompt
         self.use_bbox = use_bbox
         self.bbox_jitter = bbox_jitter
+        self.bbox_jitter_prob = bbox_jitter_prob
         self.name = name
 
     def __len__(self):
@@ -80,7 +82,8 @@ class _MattingAdapter(Dataset):
             # per-sample constant the model can memorise.
             from matting.bbox import bbox_from_alpha
             alpha = ((item["alpha_rgb"][0].float() + 1) / 2).clamp(0, 1).numpy()
-            item["bbox"] = bbox_from_alpha(alpha, self.bbox_jitter)
+            item["bbox"] = bbox_from_alpha(alpha, self.bbox_jitter,
+                                           self.bbox_jitter_prob)
         return item
 
     def sample_ids(self):
@@ -89,7 +92,7 @@ class _MattingAdapter(Dataset):
 
 def _build(cls_name, root, resolution, split, overfit_samples, overfit_seed,
            prompt, cache_composites, background_dir, pixeldit_path, name,
-           use_bbox, bbox_jitter):
+           use_bbox, bbox_jitter, bbox_jitter_prob):
     _ensure_pixeldit_importable(pixeldit_path)
     import diffusion.data.datasets.pixdit_datasets as pd
 
@@ -104,13 +107,15 @@ def _build(cls_name, root, resolution, split, overfit_samples, overfit_seed,
     if background_dir is not None:
         extra["background_dir"] = background_dir
     inner = getattr(pd, cls_name)(data_dir=[root], resolution=resolution, extra=extra)
-    return _MattingAdapter(inner, resolution, prompt, use_bbox, bbox_jitter, name)
+    return _MattingAdapter(inner, resolution, prompt, use_bbox, bbox_jitter,
+                           bbox_jitter_prob, name)
 
 
 def D646MattingDataset(root=DEFAULT_D646_ROOT, resolution=1024, split="train",
                        overfit_samples=0, overfit_seed=2025, cache_composites=None,
                        prompt=DEFAULT_PROMPT, background_dir=None,
-                       pixeldit_path=PIXELDIT_T2I, use_bbox=False, bbox_jitter=0.1):
+                       pixeldit_path=PIXELDIT_T2I, use_bbox=False, bbox_jitter=0.05,
+                       bbox_jitter_prob=0.2):
     """Distinctions-646: 596 foregrounds x 100 backgrounds, composited on the fly.
 
     This is where transparency lives -- glass, water, veils, fine hair, median
@@ -118,13 +123,15 @@ def D646MattingDataset(root=DEFAULT_D646_ROOT, resolution=1024, split="train",
     """
     return _build("Distinctions646MattingDataset", root, resolution, split,
                   overfit_samples, overfit_seed, prompt, cache_composites,
-                  background_dir, pixeldit_path, "d646", use_bbox, bbox_jitter)
+                  background_dir, pixeldit_path, "d646", use_bbox, bbox_jitter,
+                  bbox_jitter_prob)
 
 
 def AM2KMattingDataset(root=DEFAULT_AM2K_ROOT, resolution=1024, split="train",
                        overfit_samples=0, overfit_seed=2025, cache_composites=None,
                        prompt=DEFAULT_PROMPT, background_dir=None,
-                       pixeldit_path=PIXELDIT_T2I, use_bbox=False, bbox_jitter=0.1):
+                       pixeldit_path=PIXELDIT_T2I, use_bbox=False, bbox_jitter=0.05,
+                       bbox_jitter_prob=0.2):
     """AM-2K: 1800 real animal photographs, near-binary mattes (0.7-3.9% soft).
 
     Real photographs rather than composites, so no compositing cost -- but also
@@ -133,7 +140,8 @@ def AM2KMattingDataset(root=DEFAULT_AM2K_ROOT, resolution=1024, split="train",
     """
     return _build("AM2KMattingDataset", root, resolution, split,
                   overfit_samples, overfit_seed, prompt, cache_composites,
-                  background_dir, pixeldit_path, "am2k", use_bbox, bbox_jitter)
+                  background_dir, pixeldit_path, "am2k", use_bbox, bbox_jitter,
+                  bbox_jitter_prob)
 
 
 class MixtureMattingDataset(Dataset):
@@ -180,7 +188,7 @@ class MixtureMattingDataset(Dataset):
 
 def build_dataset(names=("d646",), resolution=1024, split="train",
                   overfit_samples=0, prompt=DEFAULT_PROMPT, use_bbox=False,
-                  bbox_jitter=0.1, weights=None, **kwargs):
+                  bbox_jitter=0.05, bbox_jitter_prob=0.2, weights=None, **kwargs):
     """Build one dataset or a mixture, by name."""
     builders = {"d646": D646MattingDataset, "am2k": AM2KMattingDataset}
     if isinstance(names, str):
@@ -191,5 +199,6 @@ def build_dataset(names=("d646",), resolution=1024, split="train",
             raise ValueError(f"unknown dataset {n!r}; expected one of {sorted(builders)}")
         parts.append(builders[n](
             resolution=resolution, split=split, overfit_samples=overfit_samples,
-            prompt=prompt, use_bbox=use_bbox, bbox_jitter=bbox_jitter, **kwargs))
+            prompt=prompt, use_bbox=use_bbox, bbox_jitter=bbox_jitter,
+            bbox_jitter_prob=bbox_jitter_prob, **kwargs))
     return parts[0] if len(parts) == 1 else MixtureMattingDataset(parts, weights)

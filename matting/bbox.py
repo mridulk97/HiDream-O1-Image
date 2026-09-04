@@ -13,6 +13,10 @@ Two conventions here are easy to get wrong and silent when you do:
   `[x1, y1, x2, y2]` (`models/utils.py:62`). This module uses conventional
   **xyxy** everywhere and converts only at the boundary, in
   `render_layout_image`. Nothing else should touch the xxyy form.
+The box itself is computed here rather than borrowed, because a bounding box
+from an alpha matte is `np.where` plus min/max -- see `bbox_from_alpha` for the
+two Edit2Perceive heuristics that were tried and dropped, and what they cost.
+
 * **Do not call `create_layout_reference_images`.** It renders the layout image
   (wanted) *and* stamps a coloured border inside each subject photo (not
   wanted) at `sqrt(w*h) * 0.04` -- about 41px at 1024. That border binds
@@ -29,64 +33,63 @@ from scipy.ndimage import label
 from models.utils import draw_bbox_layout, parse_layout_bboxes
 
 
-def bbox_from_alpha(alpha, jitter=0.1, rng=None):
-    """Bounding box of the largest connected component, as normalized xyxy.
+def bbox_from_alpha(alpha, jitter=0.05, jitter_prob=0.2, rng=None, threshold=0.0):
+    """Bounding box of the foreground, as normalized xyxy.
 
-    Follows Edit2Perceive's `gen_bbox`
-    (`Edit2Perceive/models/unified_dataset.py:126`): take the largest connected
-    component so a stray speck of alpha does not blow the box up to the whole
-    frame, then perturb each edge.
+    Deliberately the simple thing: the extent of every pixel with alpha above
+    `threshold`. Two heuristics from Edit2Perceive's `gen_bbox` are *not* used
+    here, because their motivation does not carry over:
 
-    The jitter is not cosmetic. With one foreground per composite the box is
-    redundant -- the model can solve the task ignoring it -- and a pixel-exact
-    box invites the degenerate solution `alpha ~= box interior`, which scores
-    well on these datasets and is useless on anything real. A box that is never
-    exact cannot be copied. Each edge moves independently, in or out, by up to
-    `jitter` of the box's size.
+    * **Largest connected component.** E2P's box selects one object among
+      several. Ours localizes, and the ground truth is every foreground pixel,
+      so dropping the smaller components contradicts the target -- a photo of
+      two cows would get a box round one of them and a matte of both. Measured
+      over 40 D-646 samples it put up to 19.9% of the alpha mass outside the
+      box, against 0.3% for the full extent.
+    * **Symmetric jitter.** E2P perturbs each edge in *or* out. A box that
+      randomly excludes part of the subject is an incoherent localization
+      claim, and it cost up to 23.7% of alpha mass outside the box. Here the
+      jitter only ever expands, so the box always contains the subject while
+      its exact edges still vary -- which is all that is needed to stop the
+      model treating it as a ready-made mask.
 
     Args:
         alpha: (H, W) float array in [0, 1].
-        jitter: max fractional perturbation per edge. 0 disables.
+        jitter: max outward expansion per edge, as a fraction of box size.
+        jitter_prob: fraction of samples that get jittered at all. The rest get
+            the exact box. Jittering only sometimes means the model mostly sees
+            an honest box -- so the box stays a trustworthy signal -- while
+            still never being able to rely on it being exact.
         rng: optional `random.Random` for reproducibility.
+        threshold: alpha above this counts as foreground.
 
     Returns:
-        [x1, y1, x2, y2] normalized to [0, 1].
+        [x1, y1, x2, y2] normalized to [0, 1], as a half-open box: x2 and y2
+        are one past the last foreground pixel, so `[y1*h:y2*h, x1*w:x2*w]`
+        contains the subject exactly.
     """
     if alpha.dtype == np.uint8:
         raise ValueError("alpha must be float in [0, 1], not uint8")
     rng = rng or random
     h, w = alpha.shape
 
-    binary = alpha > 0
-    if not binary.any():
-        # Degenerate matte: hand back a box that is valid but carries nothing.
-        return [0.0, 0.0, 1.0, 1.0]
+    ys, xs = np.where(alpha > threshold)
+    if ys.size == 0:
+        return [0.0, 0.0, 1.0, 1.0]        # degenerate matte
+    x1, x2 = int(xs.min()), int(xs.max()) + 1
+    y1, y2 = int(ys.min()), int(ys.max()) + 1
 
-    ys, xs = np.where(binary)
-    y1, y2 = int(ys.min()), int(ys.max())
-    x1, x2 = int(xs.min()), int(xs.max())
+    if jitter > 0 and rng.random() < jitter_prob:
+        # Outward only. Each edge independently, so the box is not a scaled
+        # copy of the true one.
+        bw, bh = x2 - x1, y2 - y1
+        x1 -= int(rng.uniform(0, jitter) * bw)
+        x2 += int(rng.uniform(0, jitter) * bw)
+        y1 -= int(rng.uniform(0, jitter) * bh)
+        y2 += int(rng.uniform(0, jitter) * bh)
 
-    labeled, n = label(binary)
-    if n > 1:
-        sizes = np.bincount(labeled.ravel())[1:]      # drop the background label
-        if sizes.size:
-            coords = np.argwhere(labeled == int(np.argmax(sizes)) + 1)
-            y1, x1 = coords.min(axis=0).tolist()
-            y2, x2 = coords.max(axis=0).tolist()
-
-    if jitter > 0:
-        coe = rng.uniform(0, jitter)
-        pad_y, pad_x = int(coe * (y2 - y1)), int(coe * (x2 - x1))
-        y1 += rng.choice((-1, 1)) * pad_y
-        y2 += rng.choice((-1, 1)) * pad_y
-        x1 += rng.choice((-1, 1)) * pad_x
-        x2 += rng.choice((-1, 1)) * pad_x
-        y1, y2 = min(y1, y2), max(y1, y2)
-        x1, x2 = min(x1, x2), max(x1, x2)
-
-    # Clamp, and keep at least one pixel of extent so the renderer accepts it.
-    x1 = max(0, min(w - 2, x1)); x2 = max(x1 + 1, min(w - 1, x2))
-    y1 = max(0, min(h - 2, y1)); y2 = max(y1 + 1, min(h - 1, y2))
+    x1 = max(0, x1); x2 = min(w, max(x1 + 1, x2))
+    y1 = max(0, y1); y2 = min(h, max(y1 + 1, y2))
     return [x1 / w, y1 / h, x2 / w, y2 / h]
 
 
