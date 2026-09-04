@@ -358,13 +358,7 @@ def log_preview(model, dataset, indices, args, tokenizer, processor,
         ids.append(item["sample_id"])
         gt = ((item["alpha_rgb"][0].float() + 1) / 2).clamp(0, 1).numpy()
         rgb = ((item["condition"].float() + 1) / 2).clamp(0, 1).numpy().transpose(1, 2, 0)
-        if args.use_bbox:
-            # Draw the box on a *copy* for display only -- the conditioning
-            # image the model saw is untouched. Without this the panel gives no
-            # way to tell a sensible box from a broken one, which matters here
-            # because the box is redundant on this data and a silently wrong
-            # box would look exactly like a model that ignores it.
-            rgb = _overlay_box(rgb, item["bbox"])
+
         mses.append(float(np.mean((alpha - gt) ** 2)))
         # Baselines are per-sample, not constants. all-black scores mean(gt**2),
         # which is just foreground coverage: it ranges from 0.07 on a small
@@ -374,10 +368,21 @@ def log_preview(model, dataset, indices, args, tokenizer, processor,
         # like a failing model.
         blacks.append(float(np.mean(gt ** 2)))
         means.append(float(np.mean((gt - gt.mean()) ** 2)))
-        # input RGB | generated alpha | ground truth -- same three columns, same
-        # order as PixelDiT's preview grid, so the two can be read side by side.
-        rows.append(np.concatenate(
-            [rgb, np.stack([alpha] * 3, -1), np.stack([gt] * 3, -1)], axis=1))
+        # RGB | (RGB+box) | generated alpha | ground truth. The first three
+        # columns and their order match PixelDiT's preview grid so the two can
+        # be read side by side; the box column is inserted only when bbox
+        # conditioning is on.
+        #
+        # The clean RGB is kept alongside the annotated one on purpose: the
+        # overlay covers pixels, and those are exactly the pixels a subject
+        # touching the box edge needs. Showing both means the box never hides
+        # the thing you are trying to judge. The overlay is display-only -- the
+        # conditioning image the model saw is untouched.
+        cols = [rgb]
+        if args.use_bbox:
+            cols.append(_overlay_box(rgb, item["bbox"]))
+        cols += [np.stack([alpha] * 3, -1), np.stack([gt] * 3, -1)]
+        rows.append(np.concatenate(cols, axis=1))
 
     grid = (np.concatenate(rows, axis=0) * 255).round().astype("uint8")
     mean_mse = float(np.mean(mses))
@@ -385,7 +390,8 @@ def log_preview(model, dataset, indices, args, tokenizer, processor,
     # Fraction of the all-black baseline for THESE samples. Below 1.0 beats a
     # blank prediction; this is comparable across panels, the raw mse is not.
     rel = mean_mse / max(black, 1e-9)
-    cols = "RGB+box | generated | GT" if args.use_bbox else "RGB | generated | GT"
+    cols = ("RGB | RGB+box | generated | GT" if args.use_bbox
+            else "RGB | generated | GT")
     caption = (f"step {step} | {cols} | {tag} | mse {mean_mse:.5f} "
                f"({rel:.0%} of all-black {black:.3f}, const-mean {cmean:.3f}) | "
                + ", ".join(ids))
