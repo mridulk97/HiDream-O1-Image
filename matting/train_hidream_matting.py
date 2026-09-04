@@ -635,6 +635,12 @@ def train(args):
                     "resolution": args.resolution, "prompt": args.prompt,
                     "noise_scale": NOISE_SCALE,
                     "timestep_type": args.timestep_type,
+                    # Recorded so evaluation configures itself from the
+                    # checkpoint. Scoring a bbox-trained model without a box
+                    # silently measures the wrong thing rather than failing.
+                    "use_bbox": args.use_bbox,
+                    "bbox_resolution": args.bbox_resolution,
+                    "datasets": list(args.datasets),
                 },
             }, path)
             print(f"[save] {path}")

@@ -1,29 +1,21 @@
 """Standard matting metrics over a directory of predictions.
 
-**The metric implementations are Edit2Perceive's, not ours.** SAD / MSE / MAD /
-Grad / Conn are the canonical P3M-Net implementations that matting papers
-report, and reimplementing them invites subtle mismatches that silently make our
-numbers incomparable to published ones. `compute_matting_metrics`
-(`Edit2Perceive/utils/metric.py:689`) is imported directly.
+Self-contained: the metric implementations live in `matting/metrics.py`,
+vendored from P3M-Net via Edit2Perceive, so evaluation imports nothing from a
+sibling repo. See that module for the licence and for the scale convention --
+alpha in [0, 1], SAD in units of 1000 pixels, and `mse` identical to the
+`generated_mse` the trainer reports.
 
-What is written here is the driver, because E2P's `eval_matting.py` does not fit:
+Two things this driver adds over a plain metric call:
 
-* it expects a *provided* trimap, and neither of our datasets ships one -- D-646
-  has none at all, AM-2k's are left inside the zips by `setup_am2k_data.sh`;
-* its `gen_trimap` picks a random kernel size and iteration count. That is
-  reasonable augmentation during training and wrong for evaluation, where two
-  runs of the same checkpoint must produce the same number. It also needs cv2,
-  which this environment does not have;
-* it reports one pooled figure, and we train on a mixture whose halves differ
-  sharply in difficulty.
-
-So the trimap is built deterministically from the ground-truth alpha with
-PixelDiT's `unknown_band` (separable max-pooling, no cv2, fixed radius), and
-results are reported per dataset.
-
-Note on scale: metrics take alpha in **[0, 1]**, not [0, 255]. Under that
-convention `mse_whole` is exactly the `generated_mse` the trainer reports, and
-comparable to MATTING.md's trivial baselines. SAD is in units of 1000 pixels.
+* **Per dataset.** We train on a D-646 + AM-2k mixture whose halves differ
+  sharply in difficulty (AM-2k mattes are 0.7-3.9% soft pixels, D-646's median
+  6.9%), so a pooled number lets the easy half mask regressions in the hard one.
+* **MAD bucketed by ground-truth alpha.** The whole-image mean is dominated by
+  the ~82% of pixels that are flat background or flat foreground. The soft
+  region is a few percent of the frame and is the entire matting problem;
+  measured on a real checkpoint it ran 44x worse than the background while the
+  headline MSE looked excellent.
 
 Usage::
 
@@ -38,16 +30,13 @@ import sys
 from collections import defaultdict
 
 import numpy as np
-import torch
 from PIL import Image
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(_HERE))
 
-E2P_PATH = "/home/mridul/matting/Edit2Perceive"
-PIXELDIT_T2I = "/home/mridul/matting/PixelDiT/t2i"
-
 from matting.data import DEFAULT_PROMPT, build_dataset  # noqa: E402
+from matting.metrics import compute_matting_metrics  # noqa: E402
 
 # Alpha buckets. Whole-image means hide the soft region, which is a few percent
 # of pixels and the entire matting problem -- MATTING.md measured MAD 30-56x
@@ -55,30 +44,6 @@ from matting.data import DEFAULT_PROMPT, build_dataset  # noqa: E402
 BUCKETS = (("background", 0.0, 0.02), ("near-transparent", 0.02, 0.3),
            ("half", 0.3, 0.7), ("near-opaque", 0.7, 0.98),
            ("foreground", 0.98, 1.01))
-
-
-def _import_metrics():
-    if E2P_PATH not in sys.path:
-        sys.path.insert(0, E2P_PATH)
-    from utils.metric import compute_matting_metrics
-    return compute_matting_metrics
-
-
-def _unknown_band(alpha, radius):
-    """Deterministic trimap unknown region, via PixelDiT's separable dilation."""
-    if PIXELDIT_T2I not in sys.path:
-        sys.path.insert(0, PIXELDIT_T2I)
-    from diffusion.model.matting_losses import unknown_band
-    t = torch.from_numpy(alpha)[None, None].float()
-    return unknown_band(t, radius)[0, 0].numpy()
-
-
-def _trimap(alpha, radius):
-    """0 background / 128 unknown / 255 foreground, as the metrics expect."""
-    band = _unknown_band(alpha, radius) > 0.5
-    tri = np.where(alpha >= 0.98, 255.0, 0.0)
-    tri[band] = 128.0
-    return tri.astype(np.float32)
 
 
 def _load_pred(path, shape):
@@ -90,7 +55,7 @@ def _load_pred(path, shape):
     return a
 
 
-def evaluate_dir(pred_dir, gt_by_id, radius, compute_matting_metrics):
+def evaluate_dir(pred_dir, gt_by_id):
     """Metrics per sample for every prediction present in `pred_dir`."""
     rows = []
     for sid, (gt, dataset) in gt_by_id.items():
@@ -98,8 +63,8 @@ def evaluate_dir(pred_dir, gt_by_id, radius, compute_matting_metrics):
         if not os.path.exists(path):
             continue
         pred = _load_pred(path, gt.shape)
-        mse, mad, sad, grad, conn = compute_matting_metrics(
-            pred, gt, _trimap(gt, radius), whole=True)
+        # whole=True needs no trimap, which is why none is synthesised here.
+        mse, mad, sad, grad, conn = compute_matting_metrics(pred, gt, whole=True)
         row = {"sample_id": sid, "dataset": dataset, "mse": float(mse),
                "mad": float(mad), "sad": float(sad), "grad": float(grad),
                "conn": float(conn),
@@ -138,11 +103,8 @@ def main():
     ap.add_argument("--overfit_samples", type=int, default=32)
     ap.add_argument("--num_samples", type=int, default=64)
     ap.add_argument("--prompt", default=DEFAULT_PROMPT)
-    ap.add_argument("--band_radius", type=int, default=10)
     ap.add_argument("--output", default=None)
     args = ap.parse_args()
-
-    compute_matting_metrics = _import_metrics()
 
     ds = build_dataset(names=args.datasets, resolution=args.resolution,
                        split=args.split, overfit_samples=args.overfit_samples,
@@ -154,8 +116,7 @@ def main():
         gt = ((it["alpha_rgb"][0].float() + 1) / 2).clamp(0, 1).numpy()
         gt_by_id[it["sample_id"]] = (gt, it.get("dataset", "?"))
 
-    rows = evaluate_dir(args.pred_dir, gt_by_id, args.band_radius,
-                        compute_matting_metrics)
+    rows = evaluate_dir(args.pred_dir, gt_by_id)
     if not rows:
         raise SystemExit(f"no predictions matched in {args.pred_dir}")
 
@@ -190,8 +151,7 @@ def main():
                "per_sample": rows}
 
     if args.compare_dir:
-        crows = evaluate_dir(args.compare_dir, gt_by_id, args.band_radius,
-                             compute_matting_metrics)
+        crows = evaluate_dir(args.compare_dir, gt_by_id)
         c = _agg(crows, metric_keys)
         base = _agg(rows, metric_keys)
         gap = (c["mse"] - base["mse"]) / c["mse"] if c["mse"] else 0.0

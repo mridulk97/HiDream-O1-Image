@@ -310,6 +310,66 @@ across an object's 100 backgrounds — so rank 16 already gives ~107k trainable
 parameters per distinct matte. Capacity is unlikely to be the binding
 constraint here.
 
+## Evaluation
+
+One command from an adapter to a metrics table:
+
+```bash
+bash run_matting_eval.sh /scratch/.../adapters/step_2000.pth
+```
+
+It reads resolution, prompt, datasets and **whether the checkpoint was trained
+with a bounding box** out of the checkpoint metadata, so a bbox model is never
+silently scored without one — that would not fail, it would just measure the
+wrong thing. Then it samples the correct condition, samples again with the
+reference photo shuffled (and with the box shuffled, for a bbox checkpoint), and
+prints:
+
+```
+   dataset    n       MSE       MAD       SAD      Grad      Conn  vs all-black
+      d646    4   0.00807   0.03090    32.396    34.711    26.740           3%
+
+MAD by ground-truth alpha (the soft buckets are the task):
+        background   0.00419      56.08%
+  near-transparent   0.11566       6.30%
+              half   0.16413       6.09%
+       near-opaque   0.15752       3.72%
+        foreground   0.09327      27.81%
+
+shuffled image: MSE 0.27124 vs 0.00807   gap: 97.0%
+```
+
+Read the buckets, not the headline. The whole-image MSE is dominated by the
+~84% of pixels that are flat background or flat foreground; the soft region is
+about 16% of the frame and is the entire matting problem. Here it runs **39x
+worse** than the background while the headline reads 3% of the all-black
+baseline.
+
+Useful env vars: `EVAL_NUM_SAMPLES`, `EVAL_SPLIT`, `EVAL_STEPS`,
+`EVAL_GUIDANCE`, `EVAL_DATASETS`, `EVAL_OUT`, `EVAL_SKIP_GAPS=1`. Inference is
+skipped when `results.json` already exists, so re-running only recomputes
+metrics.
+
+**The metrics are vendored, not imported.** `matting/metrics.py` holds the
+P3M-Net reference implementations of SAD / MSE / MAD / Grad / Conn, obtained via
+Edit2Perceive and reproduced under their MIT licence. They are copied rather
+than rewritten because they are what matting papers report against, and a
+from-scratch connectivity error is easy to get subtly wrong and hard to notice.
+Only the metric functions came across, which is why the module needs neither
+pandas nor cv2, and evaluation now imports nothing from a sibling repo.
+
+Two local changes to that code. `compute_matting_metrics` computed the
+trimap-restricted metrics unconditionally and discarded them under `whole=True`,
+which made `trimap=None` crash on a path that never uses a trimap; it now skips
+that work, so whole-image metrics need no trimap at all. And the non-whole path
+raises a clear error instead of failing obscurely when the trimap is missing.
+
+Note on comparability: SAD/Grad/Conn are the standard definitions and units
+(SAD in thousands of pixels, alpha in [0, 1]), so the *form* matches published
+numbers. But benchmarks evaluate against each dataset's provided trimap, and
+neither of ours ships one. These numbers compare our runs to each other; do not
+put them in a table beside published D-646 results without saying so.
+
 ## Running it
 
 ```bash

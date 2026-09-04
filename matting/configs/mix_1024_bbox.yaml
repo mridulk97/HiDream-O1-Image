@@ -43,7 +43,7 @@ grad_accum: 4          # effective batch 16
 max_steps: 20000
 seed: 42
 
-preview_every: 500
+preview_every: 50
 wandb_num_examples: 4
 preview_fixed_samples: 4
 wandb_sampling_steps: 28
