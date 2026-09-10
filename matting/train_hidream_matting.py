@@ -49,6 +49,8 @@ sys.path.insert(0, os.path.dirname(_HERE))
 
 from matting.data import (  # noqa: E402
     DEFAULT_D646_ROOT, DEFAULT_PROMPT, build_dataset)
+from models.pipeline import PATCH_SIZE  # noqa: E402
+from matting.alpha_loss import compute_alpha_loss  # noqa: E402
 from matting.sample_builder import (  # noqa: E402
     build_matting_sample, collate_samples, patchify)
 
@@ -109,24 +111,44 @@ def sample_sigma(n, kind, shift, device, generator=None, sigma_min=T_EPS):
 # model
 # --------------------------------------------------------------------------- #
 
-def lora_target_modules(model):
-    """Projection layers inside the text decoder stack, by full module name.
+def lora_target_modules(model, scope="decoder"):
+    """Which Linear layers get a LoRA adapter.
 
-    Scoped with an explicit name list rather than bare suffixes: the Qwen3-VL
-    vision tower carries similarly named Linears, and ostris's reference scopes
-    LoRA the same way (`get_transformer_block_names` -> language_model.layers).
+    Two scopes, because the reference implementation and this one disagree:
+
+    `decoder` (default here) wraps only the 252 projections inside
+    `language_model.layers` -- attention q/k/v/o and the SwiGLU MLP -- and the
+    two pixel-space layers are trained in full instead (see FULL_TRAIN_MODULES).
+
+    `all` reproduces ostris. Their selector matches the *top-level class name*
+    (`target_lora_modules = ["Qwen3VLForConditionalGeneration", ...]`) and then
+    wraps every Linear beneath it -- 374 in this model, including the 116 in the
+    vision tower, the two pixel-space layers, and `lm_head`.
+
+    Worth knowing before choosing `all`: `lm_head` (622M params) is never called
+    on the generation path, which ends at `final_layer2`, so LoRA there receives
+    no gradient at all -- allocated, optimized over, never updated. Their config
+    is a general default rather than a decision about this task.
     """
     names = []
     for name, mod in model.named_modules():
-        if isinstance(mod, nn.Linear) and ".language_model.layers." in name:
-            if name.rsplit(".", 1)[-1] in LORA_PROJECTIONS:
+        if not isinstance(mod, nn.Linear):
+            continue
+        if scope == "all":
+            names.append(name)
+        elif scope == "decoder":
+            if (".language_model.layers." in name
+                    and name.rsplit(".", 1)[-1] in LORA_PROJECTIONS):
                 names.append(name)
+        else:
+            raise ValueError(f"unknown lora_scope {scope!r}")
     if not names:
         raise RuntimeError("no LoRA targets matched -- module layout changed?")
     return names
 
 
-def setup_model(model_path, rank, alpha, dtype, gradient_checkpointing):
+def setup_model(model_path, rank, alpha, dtype, gradient_checkpointing,
+                lora_scope="decoder", full_train=True):
     from peft import LoraConfig, get_peft_model
     from transformers import AutoProcessor
 
@@ -146,7 +168,7 @@ def setup_model(model_path, rank, alpha, dtype, gradient_checkpointing):
         model.gradient_checkpointing_enable(
             gradient_checkpointing_kwargs={"use_reentrant": False})
 
-    targets = lora_target_modules(model)
+    targets = lora_target_modules(model, lora_scope)
     model = get_peft_model(
         model,
         LoraConfig(
@@ -155,9 +177,10 @@ def setup_model(model_path, rank, alpha, dtype, gradient_checkpointing):
         ),
     )
 
-    for name, param in model.named_parameters():
-        if any(f".{m}." in name for m in FULL_TRAIN_MODULES):
-            param.requires_grad_(True)
+    if full_train:
+        for name, param in model.named_parameters():
+            if any(f".{m}." in name for m in FULL_TRAIN_MODULES):
+                param.requires_grad_(True)
 
     # fp32 master weights for everything that trains; the frozen 8B stays bf16.
     # autocast casts back down per-op, so the forward is still bf16 maths.
@@ -167,8 +190,10 @@ def setup_model(model_path, rank, alpha, dtype, gradient_checkpointing):
             param.data = param.data.float()
             n_trainable += param.numel()
 
-    print(f"[setup] LoRA on {len(targets)} projections, r={rank} alpha={alpha}")
-    print(f"[setup] fully trained: {', '.join(FULL_TRAIN_MODULES)}")
+    print(f"[setup] LoRA scope '{lora_scope}': {len(targets)} Linear layers, "
+          f"r={rank} alpha={alpha}")
+    print(f"[setup] fully trained: "
+          f"{', '.join(FULL_TRAIN_MODULES) if full_train else 'none (ostris-style)'}")
     print(f"[setup] trainable params: {n_trainable/1e6:.2f}M")
     return model, processor, tokenizer, model_config
 
@@ -309,6 +334,42 @@ def _overlay_box(rgb, bbox, color=(1.0, 0.0, 0.0), width=6):
     return out
 
 
+def _label_columns(grid, labels, band_frac=0.055):
+    """Add a captioned header strip above a horizontal strip of equal columns.
+
+    Without it a four-column panel is ambiguous -- the generated matte and the
+    ground truth are both grayscale and easy to transpose when skimming.
+
+    Falls back to PIL's bitmap font if no TrueType face is present, so a missing
+    font degrades the caption rather than failing the run.
+    """
+    import numpy as np
+    from PIL import Image, ImageDraw, ImageFont
+
+    h, w = grid.shape[:2]
+    band = max(24, int(h * band_frac))
+    col_w = w // max(1, len(labels))
+    header = Image.new("RGB", (w, band), (255, 255, 255))
+    draw = ImageDraw.Draw(header)
+    try:
+        font = ImageFont.truetype(
+            "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans-Bold.ttf",
+            max(12, int(band * 0.55)))
+    except Exception:
+        font = ImageFont.load_default()
+    for i, text in enumerate(labels):
+        try:
+            x0, y0, x1, y1 = draw.textbbox((0, 0), text, font=font)
+            tw, th = x1 - x0, y1 - y0
+        except Exception:
+            tw, th = draw.textlength(text, font=font), band // 2
+        draw.text((i * col_w + (col_w - tw) // 2, (band - th) // 2), text,
+                  fill=(20, 20, 20), font=font)
+        if i:
+            draw.line([(i * col_w, 0), (i * col_w, band)], fill=(200, 200, 200), width=2)
+    return np.concatenate([np.asarray(header, dtype=grid.dtype), grid], axis=0)
+
+
 @torch.no_grad()
 def log_preview(model, dataset, indices, args, tokenizer, processor,
                 model_config, device, dtype, run, step, tag="fixed"):
@@ -385,6 +446,8 @@ def log_preview(model, dataset, indices, args, tokenizer, processor,
         rows.append(np.concatenate(cols, axis=1))
 
     grid = (np.concatenate(rows, axis=0) * 255).round().astype("uint8")
+    grid = _label_columns(grid, (["RGB", "RGB + bbox"] if args.use_bbox else ["RGB"])
+                          + ["Generated", "Ground Truth"])
     mean_mse = float(np.mean(mses))
     black, cmean = float(np.mean(blacks)), float(np.mean(means))
     # Fraction of the all-black baseline for THESE samples. Below 1.0 beats a
@@ -433,11 +496,17 @@ def train(args):
         overfit_samples=args.overfit_samples, prompt=args.prompt,
         use_bbox=args.use_bbox, bbox_jitter=args.bbox_jitter,
         bbox_jitter_prob=args.bbox_jitter_prob, weights=args.dataset_weights,
+        aug=({"aug_scale": args.aug_scale, "aug_distractors": args.aug_distractors,
+              "aug_prob": args.aug_prob, "aug_seed": args.aug_seed}
+             if (args.aug_scale or args.aug_distractors) else None),
     )
     print(f"[data] {'+'.join(args.datasets)}: {len(dataset)} samples at "
           f"{args.resolution}px | batch {args.batch_size} x accum "
           f"{args.grad_accum} = effective {args.batch_size * args.grad_accum}"
-          f"{' | bbox on, jitter ' + str(args.bbox_jitter) + ' on ' + str(int(args.bbox_jitter_prob*100)) + '%' if args.use_bbox else ''}")
+          f"{' | bbox on, jitter ' + str(args.bbox_jitter) + ' on ' + str(int(args.bbox_jitter_prob*100)) + '%' if args.use_bbox else ''}"
+          f"{' | aug scale ' + str(args.aug_scale) if args.aug_scale else ''}"
+          f"{' + ' + str(args.aug_distractors) + ' distractors' if args.aug_distractors else ''}"
+          f"{' on ' + str(int(args.aug_prob*100)) + '%' if args.aug_scale or args.aug_distractors else ''}")
     with open(os.path.join(run_dir, "manifest.json"), "w") as fh:
         ids = dataset.sample_ids() if hasattr(dataset, "sample_ids") else None
         json.dump({"sample_ids": ids, "datasets": list(args.datasets),
@@ -445,7 +514,8 @@ def train(args):
 
     model, processor, tokenizer, model_config = setup_model(
         args.model_path, args.lora_rank, args.lora_alpha, dtype,
-        args.gradient_checkpointing,
+        args.gradient_checkpointing, lora_scope=args.lora_scope,
+        full_train=not args.no_full_train,
     )
     model.train()
 
@@ -515,7 +585,8 @@ def train(args):
     random.seed(args.seed + start_step)
 
     step, micro, t_start = start_step, 0, time.time()
-    accum_loss = accum_x0 = accum_sigma = 0.0
+    accum_loss = accum_x0 = accum_sigma = accum_flow = 0.0
+    accum_alpha = {}
     sigma_buckets = {"lo": [], "mid": [], "hi": []}
     while step < args.max_steps:
         items = []
@@ -566,7 +637,33 @@ def train(args):
 
         pred = (z - x0_pred) / s.clamp_min(T_EPS)
         target = (NOISE_SCALE * eps - x0).detach()
-        loss = F.mse_loss(pred, target)
+        flow_loss = F.mse_loss(pred, target)
+        loss = flow_loss
+
+        # Alpha loss, applied at every sigma with no gating -- what E2P does
+        # (flux_image_new.py:184-198). At high sigma the x0 estimate is a poor
+        # matte rather than a meaningless one, and pushing a poor matte toward
+        # the answer is still a valid gradient; what varies with sigma is the
+        # term's magnitude, which is what the weight is for.
+        #
+        # Added to the flow loss, not substituted for it. E2P substitutes (its
+        # combined return is commented out), but RevealLayer adds at lambda 1.0
+        # and PixelDiT adds deliberately -- a band mask cannot see the interior,
+        # so something has to keep it from drifting.
+        alpha_stats = {}
+        if args.alpha_loss != "none":
+            hp = wp = args.resolution // PATCH_SIZE
+            a_loss, alpha_stats = compute_alpha_loss(
+                args.alpha_loss, x0_pred, x0, hp, wp,
+                patch_size=PATCH_SIZE, band_radius=args.band_radius)
+            if a_loss is not None:
+                # Linear warmup: the term is meaningless until the model emits
+                # something matte-shaped, and a large gradient from it early
+                # just fights the flow loss.
+                ramp = min(1.0, (step + 1) / max(1, args.alpha_loss_warmup))
+                loss = loss + args.alpha_loss_weight * ramp * a_loss
+                alpha_stats["alpha_loss"] = a_loss.item()
+                alpha_stats["alpha_ramp"] = ramp
 
         (loss / args.grad_accum).backward()
         # Every reported metric is averaged over the same micro-steps the
@@ -575,6 +672,9 @@ def train(args):
         # velocity loss carries a 1/sigma**2 factor and each micro-step drew
         # its own sigma.
         accum_loss += loss.item() / args.grad_accum
+        accum_flow += flow_loss.item() / args.grad_accum
+        for k, v in alpha_stats.items():
+            accum_alpha[k] = accum_alpha.get(k, 0.0) + v / args.grad_accum
         accum_x0 += F.mse_loss(x0_pred, x0).item() / args.grad_accum
         accum_sigma += float(sigma.mean().item()) / args.grad_accum
         # Bucketed by sigma, because the pooled number is not a progress metric:
@@ -604,6 +704,9 @@ def train(args):
                    "sigma": accum_sigma, "grad_norm": float(grad_norm),
                    "lr": optimizer.param_groups[0]["lr"],
                    "sec_per_step": (time.time() - t_start) / args.log_every}
+            if args.alpha_loss != "none":
+                rec["flow_loss"] = accum_flow
+                rec.update(accum_alpha)
             import statistics as _st
             for name, vals in sigma_buckets.items():
                 if vals:
@@ -612,7 +715,12 @@ def train(args):
             buckets = "  ".join(
                 f"{n}{rec[f'x0_mse_sigma_{n}']:.4f}"
                 for n in ("lo", "mid", "hi") if f"x0_mse_sigma_{n}" in rec)
-            print(f"[{step:>6}] loss {accum_loss:.4f}  x0_mse {accum_x0:.5f}  "
+            extra = ""
+            if args.alpha_loss != "none":
+                extra = (f"  flow {accum_flow:.4f}  "
+                         f"{args.alpha_loss} {accum_alpha.get('alpha_loss', 0):.4f}"
+                         f"x{accum_alpha.get('alpha_ramp', 0):.2f}")
+            print(f"[{step:>6}] loss {accum_loss:.4f}{extra}  x0_mse {accum_x0:.5f}  "
                   f"[{buckets}]  |g| {grad_norm:.2f}  "
                   f"{rec['sec_per_step']:.2f}s/step", flush=True)
             with open(log_path, "a") as fh:
@@ -638,6 +746,12 @@ def train(args):
                     # Recorded so evaluation configures itself from the
                     # checkpoint. Scoring a bbox-trained model without a box
                     # silently measures the wrong thing rather than failing.
+                    "lora_scope": args.lora_scope,
+                    "full_train": not args.no_full_train,
+                    "aug_scale": args.aug_scale,
+                    "aug_distractors": args.aug_distractors,
+                    "alpha_loss": args.alpha_loss,
+                    "alpha_loss_weight": args.alpha_loss_weight,
                     "use_bbox": args.use_bbox,
                     "bbox_resolution": args.bbox_resolution,
                     "datasets": list(args.datasets),
@@ -682,7 +796,8 @@ def train(args):
                 log_preview(model, dataset, rot, args, tokenizer, processor,
                             model_config, device, dtype, run, step, tag="rotating")
 
-        accum_loss = accum_x0 = accum_sigma = 0.0
+        accum_loss = accum_x0 = accum_sigma = accum_flow = 0.0
+        accum_alpha = {}
 
     print(f"[done] {step} steps -> {run_dir}")
     if run is not None:
@@ -698,6 +813,22 @@ def build_parser():
                    choices=["d646", "am2k"])
     p.add_argument("--dataset_weights", nargs="+", type=float, default=None,
                    help="mixture weights, e.g. 1 1 for 50/50; default equal")
+    p.add_argument("--aug_scale", type=float, nargs=2, default=None,
+                   metavar=("MIN", "MAX"),
+                   help="scale the foreground to this fraction of its native "
+                        "size and place it randomly. Without it the subject "
+                        "fills the frame and the box covers a median 0.69 of "
+                        "it, carrying almost no localization signal")
+    p.add_argument("--aug_distractors", type=int, default=0,
+                   help="extra foregrounds composited into the background. The "
+                        "ground truth stays the target's alpha only, so the box "
+                        "becomes the sole cue for WHICH object to matte -- the "
+                        "only setting where it is load-bearing rather than "
+                        "redundant. D-646 only")
+    p.add_argument("--aug_prob", type=float, default=0.5,
+                   help="fraction of samples augmented; the rest keep the "
+                        "original full-frame composite")
+    p.add_argument("--aug_seed", type=int, default=2025)
     p.add_argument("--use_bbox", action="store_true", default=False,
                    help="append a rendered bbox layout image as a 2nd reference")
     p.add_argument("--bbox_jitter", type=float, default=0.05,
@@ -714,6 +845,12 @@ def build_parser():
 
     p.add_argument("--lora_rank", type=int, default=16)
     p.add_argument("--lora_alpha", type=int, default=16)
+    p.add_argument("--lora_scope", default="decoder", choices=["decoder", "all"],
+                   help="'all' reproduces ostris: LoRA on every Linear in the "
+                        "model, vision tower and lm_head included")
+    p.add_argument("--no_full_train", action="store_true", default=False,
+                   help="do not train x_embedder/final_layer2 in full; ostris "
+                        "LoRAs them like everything else")
     p.add_argument("--gradient_checkpointing", action="store_true", default=True)
     p.add_argument("--no_gradient_checkpointing", dest="gradient_checkpointing",
                    action="store_false")
@@ -721,6 +858,16 @@ def build_parser():
     p.add_argument("--timestep_type", default="sigmoid",
                    choices=["sigmoid", "uniform", "shift"])
     p.add_argument("--shift", type=float, default=3.0)
+    p.add_argument("--alpha_loss", default="none", choices=["none", "band", "focal"],
+                   help="pixel-space loss on the predicted alpha. 'band' is "
+                        "E2P/PixelDiT's SAD+MSE+grad on the trimap unknown "
+                        "region; 'focal' is RevealLayer's -d^g*log(1-d)")
+    p.add_argument("--alpha_loss_weight", type=float, default=1.0)
+    p.add_argument("--alpha_loss_warmup", type=int, default=200,
+                   help="linear ramp; the term is meaningless before the model "
+                        "emits something matte-shaped")
+    p.add_argument("--band_radius", type=int, default=10,
+                   help="dilation radius for the 'band' unknown region")
     p.add_argument("--sigma_min", type=float, default=T_EPS,
                    help="floor on sampled sigma; 0.05 caps the 1/sigma^2 loss "
                         "weight at 400 instead of 1e6 (default matches the "
@@ -754,7 +901,7 @@ def build_parser():
     p.add_argument("--val_samples", type=int, default=4)
     p.add_argument("--log_every", type=int, default=10)
     p.add_argument("--save_every", type=int, default=250)
-    p.add_argument("--run_root", default="/scratch/mridul/runs/matting/hidream")
+    p.add_argument("--run_root", default="/scratch/mridul/runs/matting/hidream_v2")
     p.add_argument("--run_dir", default=None)
     p.add_argument("--wandb", action="store_true")
     p.add_argument("--wandb_project", default="hidream-matting")

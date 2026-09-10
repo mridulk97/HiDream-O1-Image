@@ -1,0 +1,63 @@
+# Faithful reproduction of ostris/ai-toolkit's HiDream-O1 training procedure.
+#
+# Every setting below matches what `hidream_o1_model.py` + `SDTrainer` would do
+# by default, so this is the baseline to compare our deviations against rather
+# than a recommended recipe. Where the two differ, the deviation is noted.
+#
+# WARNING, measured on this codebase: `timestep_type: sigmoid` -- ostris's
+# default -- lost the sampler A/B by 41x. At matched step 2000, generated_mse
+# was 0.20458 against uniform's 0.00498, and five of eight sampled mattes came
+# out flat. The cause is in matting/README.md: logit-normal puts ~1.4% of its
+# mass above sigma 0.9 and almost none above 0.99, and sampling *launches* at
+# 0.999, where this arm measured 57% of the all-black baseline. Use this config
+# to reproduce ostris, not to get a good matting model.
+
+resolution: 1024
+overfit_samples: 0
+prompt: "Transform to matting map while maintaining original composition"
+datasets: [d646]
+
+# --- ostris defaults ---------------------------------------------------------
+# `timestep_type` default in toolkit/config_modules.py:554. Their sigmoid path
+# builds a sorted 1000-entry table from sigmoid(randn) and draws uniformly over
+# its indices, which is drawing from the logit-normal distribution -- the same
+# thing sample_sigma("sigmoid") does per step.
+timestep_type: sigmoid
+
+# No floor on the *sampled* sigma. Ostris's T_EPS (1e-3) is a clamp_min applied
+# to the divisor at the point of dividing, not to the draw, so a drawn sigma of
+# 0.0004 still yields a loss weight of ~1e6. They never hit it because the
+# sigmoid sampler almost never visits small sigma; with uniform sampling it
+# cost 28% of steps to gradient clipping here.
+sigma_min: 0.001
+
+# toolkit/config_modules.py:417 -- same value we already use, not a deviation.
+max_grad_norm: 1.0
+
+# LoRA on every Linear in the model (374), matching their class-name selector,
+# and no full-training of the pixel-space layers. Note lm_head is 622M params
+# that receive no gradient on the generation path.
+lora_scope: all
+no_full_train: true
+lora_rank: 16
+lora_alpha: 16
+
+shift: 3.0
+cfg_dropout: 0.1
+lr: 1.0e-4
+weight_decay: 0.01
+gradient_checkpointing: true
+batch_size: 4
+grad_accum: 4
+max_steps: 20000
+seed: 42
+
+preview_every: 500
+wandb_num_examples: 4
+preview_fixed_samples: 4
+wandb_sampling_steps: 28
+wandb_guidance: 1.0
+log_every: 10
+val_every: 200
+val_samples: 4
+save_every: 500

@@ -9,7 +9,7 @@
 # Environment:
 #   MATTING_RUN_NAME   run name and W&B name (default hidream-matting-d646_<ts>)
 #   MATTING_CONFIG     default matting/configs/d646_1024_20k.yaml
-#   MATTING_RUN_ROOT   default /scratch/mridul/runs/matting/hidream
+#   MATTING_RUN_ROOT   default /scratch/mridul/runs/matting/hidream_v2
 #   MATTING_RUN_DIR    explicit directory, overrides ROOT/NAME
 #   MATTING_RESUME     auto (default) | 0 | /path/to/step_N.pth
 #   MATTING_DETACH     0 (default) prints to the terminal; 1 detaches to a log
@@ -22,7 +22,7 @@ cd "$here"
 
 timestamp="$(date +%Y%m%d_%H%M%S)"
 run_name="${MATTING_RUN_NAME:-hidream-matting-d646_${timestamp}}"
-run_root="${MATTING_RUN_ROOT:-/scratch/mridul/runs/matting/hidream}"
+run_root="${MATTING_RUN_ROOT:-/scratch/mridul/runs/matting/hidream_v2}"
 work_dir="${MATTING_RUN_DIR:-${run_root}/${run_name}}"
 config="${MATTING_CONFIG:-matting/configs/d646_1024_20k.yaml}"
 
