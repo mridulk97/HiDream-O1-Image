@@ -35,7 +35,8 @@ from matting.data import (  # noqa: E402
     DEFAULT_D646_ROOT, DEFAULT_PROMPT, build_dataset)
 from matting.sample_builder import build_matting_sample, unpatchify  # noqa: E402
 from matting.train_hidream_matting import (  # noqa: E402
-    DEFAULT_MODEL, FULL_TRAIN_MODULES, NOISE_SCALE, T_EPS, lora_target_modules,
+    DEFAULT_MODEL, FULL_TRAIN_MODULES, NOISE_SCALE, T_EPS, _label_columns,
+    _overlay_box, lora_target_modules,
 )
 
 PATCH_SIZE = 32
@@ -145,7 +146,7 @@ def main():
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--shuffle_conditions", action="store_true")
     ap.add_argument("--datasets", nargs="+", default=["d646"],
-                    choices=["d646", "am2k"])
+                    choices=["d646", "am2k", "aim500", "am2k_val"])
     ap.add_argument("--use_bbox", action="store_true", default=False)
     ap.add_argument("--bbox_jitter", type=float, default=0.0,
                     help="0 at eval: the box should be the honest one unless "
@@ -163,11 +164,16 @@ def main():
     from models.qwen3_vl_transformers import Qwen3VLForConditionalGeneration
 
     device, dtype = torch.device("cuda"), torch.bfloat16
-    os.makedirs(args.output_dir, exist_ok=True)
+    # <output_dir>/individual_samples/<id>.png  the matte on its own
+    # <output_dir>/grid_samples/<id>.png        RGB | RGB+box | generated | GT
+    indiv_dir = os.path.join(args.output_dir, "individual_samples")
+    grid_dir = os.path.join(args.output_dir, "grid_samples")
+    for d in (args.output_dir, indiv_dir, grid_dir):
+        os.makedirs(d, exist_ok=True)
 
     ds = build_dataset(names=args.datasets, resolution=args.size,
                        overfit_samples=args.overfit_samples, prompt=args.prompt,
-                       use_bbox=args.use_bbox, bbox_jitter=args.bbox_jitter)
+                       use_bbox=args.use_bbox, bbox_jitter=args.bbox_jitter, concat=True)
     n = min(args.num_samples, len(ds))
     boxes = [ds[i].get("bbox") for i in range(n)] if args.use_bbox else [None] * n
 
@@ -179,8 +185,12 @@ def main():
     model, meta = load_adapter(model, args.adapter_path)
     model.eval()
 
+    from tqdm import tqdm
+
     records, mses = [], []
-    for i in range(n):
+    bar = tqdm(range(n), desc=f"sampling {'+'.join(args.datasets)}", unit="img",
+               dynamic_ncols=True)
+    for i in bar:
         item = ds[i]
         # Deterministic derangement, same rule the in-training check uses.
         cond_item = ds[(i + 1) % n] if args.shuffle_conditions else item
@@ -203,18 +213,34 @@ def main():
         mses.append(mse)
 
         sid = item["sample_id"]
+        # The matte alone.
         Image.fromarray((alpha * 255).round().astype(np.uint8)).save(
-            os.path.join(args.output_dir, f"{sid}.png"))
+            os.path.join(indiv_dir, f"{sid}.png"))
         if args.save_npy:
-            np.save(os.path.join(args.output_dir, f"{sid}.npy"),
+            np.save(os.path.join(indiv_dir, f"{sid}.npy"),
                     alpha.astype(np.float32))
+
+        # And a comparison grid, same columns and order as the training preview
+        # panel so a sample can be held against what the run was showing at the
+        # time without accounting for layout differences.
+        rgb = ((item["condition"].float() + 1) / 2).clamp(0, 1).numpy().transpose(1, 2, 0)
+        cols = [rgb]
+        if args.use_bbox and boxes[i] is not None:
+            cols.append(_overlay_box(rgb, boxes[i]))
+        cols += [np.stack([alpha] * 3, -1), np.stack([gt] * 3, -1)]
+        grid = (np.concatenate(cols, axis=1) * 255).round().astype(np.uint8)
+        labels = (["RGB", "RGB + bbox"] if len(cols) == 4 else ["RGB"]) + \
+                 ["Generated", "Ground Truth"]
+        grid = _label_columns(grid, labels)
+        Image.fromarray(grid).save(os.path.join(grid_dir, f"{sid}.png"))
         records.append({"sample_id": sid, "mse": mse,
                         "dataset": item.get("dataset", "?"),
                         "condition_from": cond_item["sample_id"],
                         "box_from": args.box_from if args.use_bbox else None})
-        print(f"  {sid:>16}  mse {mse:.5f}"
-              f"{'  (shuffled cond)' if args.shuffle_conditions else ''}",
-              flush=True)
+        # Running mean on the bar rather than a line per image: a full
+        # validation pass is 700 images and the per-line output buries the
+        # summary it ends with.
+        bar.set_postfix(mse=f"{mse:.5f}", mean=f"{np.mean(mses):.5f}")
 
     mean_mse = float(np.mean(mses))
     summary = {

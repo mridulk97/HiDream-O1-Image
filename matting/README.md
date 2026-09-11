@@ -88,12 +88,27 @@ a matte from the reference at high noise, not denoising one at low noise.
 Worth being explicit, because these are the places this trainer does not match
 the reference implementation:
 
-| | ostris | here | why |
+| | ostris | here | controlled by |
 | --- | --- | --- | --- |
-| gradient clipping | `max_grad_norm` 1.0 | 1.0 | same; not a deviation |
-| σ floor | none — `T_EPS` 1e-3 only guards the *divisor* | **`sigma_min` 0.05 on the sampled σ** | see below |
-| timestep sampling | `sigmoid` (logit-normal) default | **uniform** | won the A/B 41x, below |
-| LoRA scope | every Linear in the model (374) | 252 decoder projections; pixel layers trained in full | see the LoRA section |
+| gradient clipping | `max_grad_norm` 1.0 | 1.0 | `max_grad_norm` — same, not a deviation |
+| σ floor | none — `T_EPS` 1e-3 only guards the *divisor* | `sigma_min` 0.05 on the sampled σ | `sigma_min` |
+| timestep sampling | `sigmoid` (logit-normal) default | uniform | `timestep_type` |
+| LoRA scope | every Linear (374), pixel layers included | 252 decoder projections | `lora_scope` |
+| pixel layers | LoRA'd like the rest | `x_embedder`/`final_layer2` trained in full | `no_full_train` |
+
+**`matting/configs/d646_1024_ostris.yaml` reproduces their side of that table
+exactly** — 374 LoRA layers, no full-training, sigmoid sampling, no σ floor.
+It exists as the baseline to measure our deviations against, not as a
+recommended recipe: `timestep_type: sigmoid` lost the sampler A/B by 41x
+(generated_mse 0.20458 vs 0.00498 at matched step 2000, five of eight sampled
+mattes flat). Their 374-layer scope is also *fewer* trainable parameters than
+ours — 55.45M against 63.58M — because the two pixel-space layers we train in
+full are 20M on their own.
+
+On their sigmoid path specifically: `set_train_timesteps` builds a sorted
+1000-entry table from `sigmoid(randn)` and the trainer draws uniformly over its
+*indices*, which is drawing from the logit-normal distribution — the same thing
+`sample_sigma("sigmoid")` does per step, so that piece was already faithful.
 
 The σ floor is the one worth understanding. Ostris's `T_EPS` is a `clamp_min` at
 the point of dividing, so a drawn σ of 0.0004 still yields a loss weight of 10⁶.
@@ -245,7 +260,12 @@ box gap = (shuffled_mse - correct_mse) / shuffled_mse
 ```
 
 Under 10% means the model is ignoring the box and the change is doing nothing,
-whatever `generated_mse` says. Baseline on the pretrained checkpoint is **−0.9%**
+whatever `generated_mse` says. **Read the median and the moved count, not the
+mean** — the evaluator prints all three. On one checkpoint a 76.5% mean gap came
+entirely from 2 of 16 samples moving ~25x while the other 14 moved 1.00x, and
+the same checkpoint scored 1.2% on an overlapping set that happened to exclude
+them. The medians agreed at 1.00x and 1.01x: swapping the box changes nothing
+for the typical sample. Baseline on the pretrained checkpoint is **−0.9%**
 (measured), so any gap after training is attributable to training rather than to
 HiDream's pretrained layout ability. The probe also reports IoU between the
 prediction and the box interior: near 1.0 with rectangular output means the
@@ -271,6 +291,67 @@ One subtlety that bit us: validation indices are `i * stride + i`, not
 `i * stride`. With a two-source interleave and an even stride, every validation
 sample lands on the same dataset — with `d646+am2k` and stride 4, indices
 0/4/8/12 are all D-646 and AM-2k is never validated.
+
+## Alpha losses
+
+The flow loss alone leaves the actual matting problem largely unsolved. On a
+trained checkpoint the evaluator reports MAD 0.006 in the background against
+0.20 in the half-alpha bucket — **roughly 30x worse in the few percent of pixels
+that are the task** — while the headline MSE reads 2% of the all-black baseline.
+`--alpha_loss` acts on the alpha directly.
+
+| | `band` | `focal` |
+| --- | --- | --- |
+| source | E2P `get_cycle_consistency_matting_loss` | RevealLayer, arXiv 2605.11818 eq. 16 |
+| form | SAD + MSE + gradient, restricted to the trimap unknown region | `-(δ^γ)·log(1-δ)`, δ = τ·\|α̂-α\|, τ 0.95, γ 1.5 |
+| needs a trimap | yes (synthesised from GT alpha) | no |
+| evidence | PixelDiT: generated_mse 0.0048 → 0.00032, ~15x | untested on matting |
+| magnitude at weight 1.0 | 0.07–0.55, comparable to the flow loss | 0.0004–0.033 |
+
+**They are not interchangeable at the same weight.** Measured in a smoke test,
+`band` runs up to 1.8x the flow loss while `focal` is 10–300x smaller; focal
+wants `--alpha_loss_weight` around 20 to have comparable influence. The log
+prints `flow` and the alpha term separately for exactly this reason.
+
+Applied at **every** sigma with no gating, which is what E2P does
+(`flux_image_new.py:184-198`). At high sigma the x0 estimate is a poor matte
+rather than a meaningless one, and pushing a poor matte toward the answer is
+still a valid gradient; what varies with sigma is the term's magnitude.
+
+**Added** to the flow loss, not substituted for it. E2P substitutes — its
+`return flow_loss, cycle_consistency_loss` is commented out in favour of
+returning the cycle loss alone — but RevealLayer adds at λ 1.0, and PixelDiT
+adds deliberately because a band mask cannot see the interior and something has
+to keep it from drifting.
+
+This is cheaper here than in either paper: E2P must invert the velocity
+prediction and run a VAE decode to reach pixels, RevealLayer decodes through an
+RGBA VAE, while HiDream's head emits x0 in pixel space already.
+
+## Composite augmentation
+
+Unaugmented, the box covers a median **0.69** of the frame on D-646 (0.59 on
+AM-2k) and more than 0.80 on 35% of samples. A box over two-thirds of the
+picture barely localizes, and with one foreground per image it never selects
+either — so the box is both uninformative and redundant.
+
+```yaml
+aug_scale: [0.5, 0.75]   # shrink the subject and place it randomly
+aug_distractors: 2       # other foregrounds, GT stays the target's alpha alone
+aug_prob: 0.5            # the rest keep the original full-frame composite
+```
+
+Measured effect on box area: median 0.66 → **0.30**, spanning 0.12 to 0.99.
+Keeping half the samples unaugmented matters — an earlier `[0.3, 0.7]` at 100%
+produced *no* sample above 0.479, so the model would only ever have seen small
+subjects and would likely have degraded on the large ones the eval sets contain.
+
+Distractors are the part that makes the box *load-bearing*: with several
+plausible objects present it is the sole cue for which one to matte. D-646 only;
+AM-2k ships finished photographs with nothing to recomposite.
+
+Compositing stays at native resolution before the resize, and every choice is
+seeded per sample id, so `<fg>_<k>` is byte-identical on every epoch.
 
 ## Four ways the metrics lied
 
@@ -354,8 +435,42 @@ constraint here.
 One command from an adapter to a metrics table:
 
 ```bash
-bash run_matting_eval.sh /scratch/.../adapters/step_2000.pth
+bash run_matting_eval.sh /scratch/.../adapters/step_5000.pth
 ```
+
+Each dataset runs separately and completely, laid out as:
+
+```
+<EVAL_OUT>/
+  aim500/
+    individual_samples/<id>.png   the predicted matte on its own
+    grid_samples/<id>.png         RGB | RGB + bbox | Generated | Ground Truth
+    metrics.json  metrics.txt
+    shuffled_image/ shuffled_box/ controls, only with EVAL_GAPS=1
+  am2k_val/
+    ...
+```
+
+**Two resolutions, deliberately independent.** Generation resolution is what the
+model samples at and defaults to the checkpoint's trained size, since anything
+else is off-grid. Metric resolution is what predictions and ground truth are
+compared at, and defaults to `native` — E2P's protocol, scoring at the ground
+truth's own size with the prediction upsampled to meet it
+(`F.interpolate(mode="bilinear", align_corners=True)`, matching their
+`resize_tensor`). That is what makes a number comparable to published results.
+
+```bash
+EVAL_RESOLUTION=512 EVAL_RES_SCOPE=metric   # generate at trained size, score at 512
+EVAL_RESOLUTION=512 EVAL_RES_SCOPE=both     # generate AND score at 512
+```
+
+**State the metric resolution with any number you report.** SAD/Grad/Conn are
+pixel sums: the same checkpoint scored SAD 19.30 at native and 2.62 at 512.
+MSE/MAD are means and barely move. `metrics.txt` records it in a header line for
+this reason.
+
+Evaluation uses the complete dataset by default — 500 for AIM-500, 200 for AM-2k
+validation. `EVAL_NUM_SAMPLES` is only for quick checks.
 
 It reads resolution, prompt, datasets and **whether the checkpoint was trained
 with a bounding box** out of the checkpoint metadata, so a bbox model is never
@@ -411,33 +526,102 @@ put them in a table beside published D-646 results without saying so.
 
 ## Running it
 
+Everything below runs from `HiDream-O1-Image/` in the `hidream` conda env. The
+launcher runs in the **foreground** by default so the log is your terminal;
+`MATTING_DETACH=1` backgrounds it to `stdout.log` instead.
+
+### Train
+
 ```bash
-# train
-python -m matting.train_hidream_matting --config matting/configs/d646_1024.yaml
-python -m matting.train_hidream_matting --config matting/configs/d646_1024.yaml \
-    --timestep_type uniform
+# 1. Reproduce ostris's procedure exactly -- the reference baseline
+MATTING_RUN_NAME=ostris_baseline \
+MATTING_CONFIG=matting/configs/d646_1024_ostris.yaml \
+bash run_matting_hidream.sh
 
-# gates — run after touching sample_builder.py
-python -m unittest matting.tests.test_sample_builder -v
-python -m matting.probe_zero_step_identity
-python -m matting.probe_sample_wiring
+# 2. Our recipe: bbox conditioning, D-646 + AM-2k 50/50
+MATTING_RUN_NAME=bbox_mix \
+MATTING_CONFIG=matting/configs/mix_1024_bbox.yaml \
+bash run_matting_hidream.sh
 
-# diagnostics
-python -m matting.probe_sigma_sweep --adapter_path <run>/adapters/step_N.pth
-python -m matting.sample_matting --adapter_path <run>/adapters/step_N.pth \
-    --output_dir <run>/eval --num_samples 8
-python -m matting.sample_matting ... --shuffle_conditions   # conditioning gap
+# 3. D-646 only, no bbox (the launcher's default config)
+MATTING_RUN_NAME=d646_run bash run_matting_hidream.sh
 ```
 
-Judge on `generated_mse` against the trivial baselines and on the
-correct-vs-shuffled gap — never on training loss, which carries the 1/σ² weight
-and is not comparable across steps that drew different σ.
+Any config value can be overridden on the command line, and the override wins:
+
+```bash
+MATTING_RUN_NAME=lr_test bash run_matting_hidream.sh --lr 1e-4 --max_steps 6000
+```
+
+**Auto-resume.** Re-running the identical command picks up the highest
+checkpoint in that run directory and reattaches to the same W&B run. For a clean
+start use a new `MATTING_RUN_NAME`, or `MATTING_RESUME=0`.
+
+Launcher variables: `MATTING_RUN_NAME`, `MATTING_CONFIG`, `MATTING_RUN_ROOT`,
+`MATTING_RUN_DIR`, `MATTING_RESUME`, `MATTING_DETACH`, `MATTING_NO_WANDB`,
+`MATTING_TEE`, `MATTING_SKIP_DATA_SETUP`.
+
+### The four configs
+
+| config | timestep | σ floor | LoRA scope | data | bbox |
+| --- | --- | --- | --- | --- | --- |
+| `d646_1024_ostris.yaml` | sigmoid | 0.001 | all 374 | d646 | no |
+| `d646_1024.yaml` | uniform | 0.05 | decoder 252 | d646 | no |
+| `d646_1024_20k.yaml` | uniform | 0.05 | decoder 252 | d646 | no |
+| `mix_1024_bbox.yaml` | uniform | 0.05 | decoder 252 | d646+am2k | yes |
+
+`d646_1024_ostris.yaml` exists to measure our deviations against, **not** as a
+recommended recipe — its `timestep_type: sigmoid` lost the sampler A/B by 41x.
+See "What deviates from ostris" above.
+
+### Evaluate
+
+One command from an adapter to a metrics table:
+
+```bash
+bash run_matting_eval.sh /scratch/mridul/runs/matting/hidream_v2/<run>/adapters/step_2000.pth
+```
+
+It reads resolution, prompt, datasets and whether the checkpoint was trained
+with a box out of the checkpoint metadata, samples the correct condition plus a
+shuffled-image control (and a shuffled-box control for a bbox checkpoint), and
+prints per-dataset metrics with MAD bucketed by ground-truth alpha.
+
+Variables: `EVAL_NUM_SAMPLES` (16), `EVAL_SPLIT` (train), `EVAL_STEPS` (28),
+`EVAL_GUIDANCE` (1.0), `EVAL_DATASETS`, `EVAL_OUT`, `EVAL_SKIP_GAPS=1`.
+Inference is skipped when `results.json` already exists, so re-running only
+recomputes metrics.
+
+### Gates and diagnostics
+
+Run the gates after touching `sample_builder.py` or the model surgery:
+
+```bash
+python -m unittest matting.tests.test_sample_builder -v    # 9 layout parity tests
+python -m matting.probe_zero_step_identity [--use_bbox]    # step 0 must be bit-exact
+python -m matting.probe_sample_wiring                      # target slice + ref stream live
+python -m matting.probe_can_it_learn                       # can the loop fit one sample?
+```
+
+Diagnostics, on a checkpoint:
+
+```bash
+python -m matting.probe_sigma_sweep --adapter_path <ckpt>  # where along σ it is weak
+python -m matting.probe_box_wiring  --adapter_path <ckpt>  # does it read the box?
+```
+
+### What to watch
+
+`preview/fixed_generated_mse` is the task metric. `x0_mse_sigma_lo/mid/hi` are
+the readable training curves — the pooled `x0_mse` and `loss` are not, because
+the loss carries a 1/σ² weight and σ is redrawn every step. And read the
+soft-alpha buckets from the evaluator rather than the headline MSE: the
+whole-image mean is dominated by flat background and flat foreground, and the
+soft region where matting actually happens has measured 39x worse.
 
 ## Not done yet
 
-Batching (memory is 19.5 GB of 150 GB, so batch 1 leaves ~6× on the table;
-`input_ids` is embedded directly at `qwen3_vl_transformers.py:1428` rather than
-broadcast, so it needs real work). LPIPS and perceptual DINO (paper §3.4 — part
+LPIPS and perceptual DINO (paper §3.4 — part
 of HiDream's actual objective; cheap here because `x_pred` *is* the image, but
 both networks were trained on natural images and a matte is not one). 2048²
 training. Flash attention — FA4 is installed and forward-verified through a shim

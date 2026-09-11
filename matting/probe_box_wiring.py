@@ -47,7 +47,7 @@ def main():
     ap.add_argument("--adapter_path", default=None)
     ap.add_argument("--model_path", default=DEFAULT_MODEL)
     ap.add_argument("--datasets", nargs="+", default=["d646"],
-                    choices=["d646", "am2k"])
+                    choices=["d646", "am2k", "aim500", "am2k_val"])
     ap.add_argument("--size", type=int, default=1024)
     ap.add_argument("--num_samples", type=int, default=4)
     ap.add_argument("--overfit_samples", type=int, default=32)
@@ -68,7 +68,7 @@ def main():
     # noise added on top of it.
     ds = build_dataset(names=args.datasets, resolution=args.size,
                        overfit_samples=args.overfit_samples, prompt=args.prompt,
-                       use_bbox=True, bbox_jitter=0.0)
+                       use_bbox=True, bbox_jitter=0.0, concat=True)
     n = min(args.num_samples, len(ds))
     items = [ds[i] for i in range(n)]
     boxes = [it["bbox"] for it in items]
